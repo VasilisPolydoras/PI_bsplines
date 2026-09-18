@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.npy
+*.docx
+*.pdf
+*.png
+*.pptx
+*.txt
+*.ppt
+*.pth
+*.pt
