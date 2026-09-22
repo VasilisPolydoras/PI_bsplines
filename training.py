@@ -35,17 +35,10 @@ def train(
     for epoch in range(epochs):
         optimizer.zero_grad()
         loss = loss_fn()
-        loss.backward()
-        optimizer.step()
-
-        # Monitor the updated parameters, so the saved state and loss correspond.
-        with torch.no_grad():
-            loss_value = loss_fn().item()
+        loss_value = loss.detach().item()
         loss_history.append(loss_value)
 
-        if scheduler is not None:
-            scheduler.step(loss_value)
-
+        # The loss and saved parameters refer to the same pre-update state.
         if loss_value < best_loss - min_delta:
             best_loss = loss_value
             best_parameters = [
@@ -54,6 +47,12 @@ def train(
             patience_counter = 0
         else:
             patience_counter += 1
+
+        loss.backward()
+        optimizer.step()
+
+        if scheduler is not None:
+            scheduler.step(loss_value)
 
         if print_every > 0 and (epoch + 1) % print_every == 0:
             current_lr = optimizer.param_groups[0]["lr"]

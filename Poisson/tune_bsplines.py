@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from hyperparameter_optimization import run_tpe_study
-from Poisson.Poisson_2D import bsplines, build_poisson_system
+from Poisson.Bspline_2D import bsplines, build_poisson_system
 from training import train
 
 
@@ -25,7 +25,7 @@ TUNING_EPOCHS = 10000
 N_TRAIN_POINTS = 5000
 N_VALIDATION_POINTS = 5000
 LEARNING_RATE = 1e-3
-RESULT_PATH = Path(__file__).resolve().parent / "results" / "bspline_hyperparameters.json"
+RESULT_PATH = Path(__file__).resolve().parent / "results" / "best_bspline_hyperparameters.json"
 
 
 def set_seed(seed=SEED):

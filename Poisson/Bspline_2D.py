@@ -1,3 +1,4 @@
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -18,24 +19,30 @@ HYPERPARAMETER_PATH = (
     / "results"
     / "best_bspline_hyperparameters.json"
 )
+DEFAULT_DEVICE = "gpu"  # Choose "cpu" or "gpu".
 
 
 ### B-spline representation for the 2D Poisson problem ###
 class bsplines:
    
 
-    def __init__(self, n_basis, degree):
+    def __init__(self, n_basis, degree, device=None):
+        device = torch.device("cpu") if device is None else torch.device(device)
         self.degree = degree
         self.n_basis = n_basis
         self.n_knots = n_basis + degree + 1
-        knot_vector = torch.linspace(0, 1, self.n_knots - 2 * degree)
+        knot_vector = torch.linspace(
+            0, 1, self.n_knots - 2 * degree, device=device
+        )
         self.knot_vector = torch.cat((
-            torch.full((degree,), knot_vector[0]), knot_vector,
-            torch.full((degree,), knot_vector[-1]),
+            torch.full((degree,), knot_vector[0], device=device), knot_vector,
+            torch.full((degree,), knot_vector[-1], device=device),
         ))
         self.knot_x = self.knot_vector.clone()
         self.knot_y = self.knot_vector.clone()
-        self.coeffs = torch.rand(n_basis, n_basis, requires_grad=True)
+        self.coeffs = torch.rand(
+            n_basis, n_basis, device=device, requires_grad=True
+        )
 
     def basis_matrix(self, x, degree=None, knots=None):
         """Evaluate all B-spline basis functions without autograd."""
@@ -146,19 +153,30 @@ def load_best_bspline_hyperparameters(path=HYPERPARAMETER_PATH):
 
 
 ### Main function: train the B-spline model to solve the 2D Poisson problem . ###
-def main():
+def select_device(device_name):
+    """Map the user-facing CPU/GPU choice to a PyTorch device."""
+    if device_name == "gpu":
+        if not torch.cuda.is_available():
+            raise RuntimeError("GPU was requested, but CUDA is not available")
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def main(device_name=DEFAULT_DEVICE):
     
     torch.manual_seed(42)
+    device = select_device(device_name)
+    print(f"Using device: {device}")
 
     ### Load the best B-spline hyperparameters from the tuning results. ###
     n_basis, degree = load_best_bspline_hyperparameters()
     print(f"Using tuned B-splines: n_basis={n_basis}, degree={degree}")
 
     ### Create the B-spline model with the loaded hyperparameters. ###
-    model = bsplines(n_basis, degree)
+    model = bsplines(n_basis, degree, device=device)
 
     ### Generate random collocation points in the unit square (full batch training). ###
-    X = torch.rand(5000, 2)
+    X = torch.rand(5000, 2, device=device)
 
     ### Computation of the Laplacian matrix and source vector on collocation points. ###
     laplacian_matrix, source = build_poisson_system(model, X)
@@ -171,6 +189,8 @@ def main():
 
     ### Training settings. ###
     epochs = 20000
+    # test
+    # epochs = 100
     learning_rate = 1e-3
     optimizer = torch.optim.Adam([model.coeffs], lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -184,7 +204,7 @@ def main():
         parameters=[model.coeffs], loss_fn=poisson_residual_loss,
         optimizer=optimizer, epochs=epochs, scheduler=scheduler,
         early_stopping_patience=early_stopping_patience,
-        min_delta=min_delta, print_every=5,
+        min_delta=min_delta, print_every=100,
     )
 
 
@@ -192,9 +212,9 @@ def main():
     x = y = np.linspace(0, 1, 100)
     Xg, Yg = np.meshgrid(x, y)
     XY = np.vstack([Xg.ravel(), Yg.ravel()]).T
-    XY_torch = torch.tensor(XY, dtype=torch.float32)
+    XY_torch = torch.tensor(XY, dtype=torch.float32, device=device)
     with torch.no_grad():
-        u_pred = model.forward(XY_torch).numpy().reshape(Xg.shape)
+        u_pred = model.forward(XY_torch).cpu().numpy().reshape(Xg.shape)
     fig, axs = plt.subplots(1, 3, figsize=(15, 4))
     u_exact = np.sin(np.pi * Xg) * np.sin(np.pi * Yg)
 
@@ -228,4 +248,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Train the 2D Poisson B-spline model")
+    parser.add_argument(
+        "--device",
+        choices=("cpu", "gpu"),
+        default=DEFAULT_DEVICE,
+        help=f"Training device (default: {DEFAULT_DEVICE})",
+    )
+    arguments = parser.parse_args()
+    main(arguments.device)
