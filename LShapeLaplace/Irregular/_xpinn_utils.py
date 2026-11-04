@@ -250,13 +250,23 @@ def plot_solution(
     print(f"Saved solution plot to: {figure_path}")
 
 
-def plot_training_history(loss_history: list[float], model, postprocessing_dir: Path) -> None:
+def plot_training_history(
+    loss_history: list[float],
+    model,
+    postprocessing_dir: Path,
+    training_time_seconds: float,
+) -> None:
     """Save the loss history as numerical data and a figure."""
     postprocessing_dir.mkdir(parents=True, exist_ok=True)
     loss = np.asarray(loss_history, dtype=float)
     epochs = np.arange(1, loss.size + 1)
     data_path = postprocessing_dir / f"{model.output_stem}_training_data.npz"
-    np.savez_compressed(data_path, epoch=epochs, loss=loss)
+    np.savez_compressed(
+        data_path,
+        epoch=epochs,
+        loss=loss,
+        training_time_seconds=np.asarray(training_time_seconds, dtype=float),
+    )
     figure, axis = plt.subplots(figsize=(6, 4))
     axis.semilogy(epochs, loss)
     axis.set_xlabel("Epoch")

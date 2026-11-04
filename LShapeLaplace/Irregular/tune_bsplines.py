@@ -18,14 +18,19 @@ from LShapeLaplace.Irregular.Bspline_2D import (
     DEFAULT_DEVICE,
     INTERFACE_FLUX_WEIGHT,
     INTERFACE_RESIDUAL_WEIGHT,
+    INTERIOR_INITIALIZATION,
     LEARNING_RATE,
+    N_BOUNDARY_POINTS_PER_EDGE,
     PDE_WEIGHT,
     RESULT_PATH,
     SEED,
     LShapeBSpline,
+    generate_inhomogeneous_boundary_local_points,
     generate_interface_local_points,
+    precompute_boundary_operators,
     precompute_interface_operators,
     precompute_operators,
+    pretrain_boundary_coefficients,
     relative_l2_error,
     sample_local_points,
     select_device,
@@ -37,7 +42,7 @@ from training import train
 
 
 N_TRIALS = 50
-TUNING_EPOCHS = 10_000
+TUNING_EPOCHS = 2500
 N_TRAIN_POINTS = 2_000
 N_VALIDATION_POINTS = 6_000
 N_INTERFACE_POINTS = 500
@@ -47,6 +52,7 @@ FIXED_KNOT_CONCENTRATION = 1.0
 def make_objective(
     training_points: torch.Tensor,
     validation_points: torch.Tensor,
+    boundary_points: dict[str, torch.Tensor],
     interface_points,
     device: torch.device,
     tuning_epochs: int = TUNING_EPOCHS,
@@ -64,6 +70,17 @@ def make_objective(
             degree,
             FIXED_KNOT_CONCENTRATION,
             device,
+            INTERIOR_INITIALIZATION,
+        )
+        boundary_operators = precompute_boundary_operators(
+            model, boundary_points
+        )
+        pretrain_boundary_coefficients(
+            model,
+            boundary_points,
+            boundary_operators,
+            epochs=tuning_epochs,
+            print_every=0,
         )
         training_operators = precompute_operators(
             model, training_points, max_order=2
@@ -126,11 +143,15 @@ def main(
     interface_points = generate_interface_local_points(
         N_INTERFACE_POINTS, device, CORNER_EPSILON
     )
+    boundary_points = generate_inhomogeneous_boundary_local_points(
+        N_BOUNDARY_POINTS_PER_EDGE, device
+    )
 
     study = run_tpe_study(
         make_objective(
             training_points,
             validation_points,
+            boundary_points,
             interface_points,
             device,
             tuning_epochs,

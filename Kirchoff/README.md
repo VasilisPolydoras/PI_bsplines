@@ -1,36 +1,34 @@
 # Simply supported Kirchhoff plate
 
-This folder compares three physics-informed representations for
+This folder compares PI-TP-BsA, PINN, and PIKAN approximations of
 
 \[
 D\left(w_{xxxx}+2w_{xxyy}+w_{yyyy}\right)=q(x,y)
 \]
 
-on `[0,10] x [0,10]`, with sinusoidal loading and simply supported edges
-`w = 0`, `M_nn = 0`.
+on `[0,10] x [0,10]`, with sinusoidal loading and simply supported conditions
+`w=0` and `M_nn=0` on every edge.
 
-## Solvers
+- `Bspline_2D.py` uses analytical derivatives through fourth order and a
+  coefficient transform that imposes both boundary conditions exactly.
+- `PINN_2D.py` and `PIKAN_2D.py` provide soft and hard constraints. Their hard
+  sine/cosine trial construction satisfies deflection and moment conditions.
+- Every solver has an independent JSON configuration and Optuna tuner.
+- `run_statistics.py` varies only initialization seeds while fixing training
+  and validation samples, then saves errors, timings, dispersion, and 95% CIs.
+- `postprocessing/plot_results.py` recreates split PDF comparisons and the
+  combined loss-evolution figure from NPZ files.
 
-- `Bspline_2D.py`: hard `w=0` and `w_nn=0` through a coefficient transform.
-- `PINN_2D.py`: `--constraint soft` uses boundary losses; `hard` uses a
-  sine/cosine trial space that satisfies both conditions exactly.
-- `PIKAN_2D.py`: the same soft/hard formulations using PyKAN.
-
-Each solver reads its own JSON configuration. Tuned parameters are written by
-`tune_bsplines.py`, `tune_pinn.py`, and `tune_pikan.py`.
-
-Examples:
-
-```powershell
-python Kirchoff/Bspline_2D.py --device cpu
-python Kirchoff/PINN_2D.py --device cpu --constraint hard
-python Kirchoff/PINN_2D.py --device cpu --constraint soft
-python Kirchoff/PIKAN_2D.py --device cpu --constraint hard
-```
-
-Recreate saved plots without training:
+The common training, sampling, tuning, output, and plotting settings mirror
+the corresponding Diffusion configuration. Plate-specific exceptions are the
+B-spline degree range `4--6` and PIKAN spline order `4--6`, required for stable
+fourth derivatives.
 
 ```powershell
+python Kirchoff/Bspline_2D.py
+python Kirchoff/PINN_2D.py --constraint soft
+python Kirchoff/PIKAN_2D.py --constraint hard
+python Kirchoff/tune_bsplines.py
+python Kirchoff/run_statistics.py --solver pinn --constraint hard
 python Kirchoff/postprocessing/plot_results.py --solver all --show
 ```
-

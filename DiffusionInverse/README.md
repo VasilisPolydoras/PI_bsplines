@@ -1,15 +1,24 @@
 # Inverse diffusion equation
 
-Identifies the positive diffusivity `alpha` while learning the solution of
-`u_t-alpha*u_xx=0`. Synthetic observations use the exact solution with true
-`alpha=0.03`; the default observation noise standard deviation is `0.05`, as
-in `diffusion_inverse_gpu.ipynb`. Set `noise_std` to zero for clean data.
+This folder mirrors the structure and common numerical settings of `Diffusion`
+for identification of the positive diffusivity in `u_t - D u_xx = 0`.
 
-The B-spline method hard-imposes the spatial boundaries and constructs its
-initial coefficient trace by Greville interpolation. PINN and PIKAN support
-hard and soft constraints. Positivity is enforced as
-`alpha=alpha_min+softplus(raw_alpha)`.
+It contains B-spline, PINN, and PIKAN solvers, one JSON configuration and one
+Optuna tuner per solver, consolidated postprocessing, and a selectable repeated-
+run statistics script. PINN and PIKAN support soft and hard initial/boundary
+constraints. The B-spline solver imposes the homogeneous spatial boundaries
+exactly, pretrains and freezes the inhomogeneous initial trace, and jointly
+trains the remaining coefficients and diffusivity.
 
-Tuners minimize field relative L2 error plus diffusivity relative error.
-Results and parameter histories are stored in `postprocessing`. Replot with
-`python DiffusionInverse/postprocessing/plot_results.py --show`.
+Inverse-only configuration entries specify the initial/minimum diffusivity,
+sensor count, observation noise, and data-loss weight. Common training,
+sampling, scheduling, early-stopping, tuning-budget, and architecture-search
+settings match the corresponding forward Diffusion solvers.
+
+```text
+python DiffusionInverse/Bspline_2D.py --device gpu
+python DiffusionInverse/PINN_2D.py --device gpu --constraint hard
+python DiffusionInverse/PIKAN_2D.py --device gpu --constraint soft
+python DiffusionInverse/run_statistics.py --solver bspline --runs 10 --device gpu
+python DiffusionInverse/postprocessing/plot_results.py --solver all --show
+```

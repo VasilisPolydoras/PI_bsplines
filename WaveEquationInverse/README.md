@@ -1,14 +1,32 @@
 # Inverse wave equation
 
-Identifies the positive physical wave speed `c` in
-`u_tt-c^2*u_xx=0`. Synthetic data use `c_true=1` and the exact field
-`sin(pi*x) cos(pi*c*t)`. The default observation noise is `0.05`.
+This folder mirrors the structure and common numerical settings of
+`DiffusionInverse` while retaining the wave-equation physics. It identifies the
+positive wave speed in
 
-For B-splines, the Greville-interpolated displacement is stored in the first
-time coefficient row. The second row is set equal to the first, which exactly
-imposes `u_t(x,0)=0` for the clamped time basis. Spatial boundary columns are
-zero. Thus none of these conditions needs a penalty.
+```text
+u_tt - c^2 u_xx = 0,
+u(x, 0) = sin(pi x),  u_t(x, 0) = 0,
+u(0, t) = u(1, t) = 0.
+```
 
-PINN and PIKAN offer hard and soft constraints. Positivity is enforced with
-`c=c_min+softplus(raw_c)`. Tuners minimize validation field error plus relative
-wave-speed error, and postprocessing archives include the complete `c` history.
+The folder contains B-spline, PINN, and PIKAN solvers, one JSON configuration
+and one Optuna tuner per solver, consolidated postprocessing, and a selectable
+repeated-run statistics script. PINN and PIKAN support soft and hard
+initial/boundary constraints. The B-spline solver imposes the homogeneous
+spatial boundaries and zero initial velocity exactly, pretrains and freezes the
+inhomogeneous initial-displacement trace, and jointly trains the remaining
+coefficients and wave speed.
+
+Inverse-only configuration entries define the initial and minimum wave speed,
+sensor count, observation noise, and data-loss weight. Sampling, optimization,
+scheduling, early stopping, tuning budgets, and architecture search ranges
+match `DiffusionInverse`; only PDE-specific fields and residuals differ.
+
+```text
+python WaveEquationInverse/Bspline_2D.py --device gpu
+python WaveEquationInverse/PINN_2D.py --device gpu --constraint hard
+python WaveEquationInverse/PIKAN_2D.py --device gpu --constraint soft
+python WaveEquationInverse/run_statistics.py --solver bspline --runs 10 --device gpu
+python WaveEquationInverse/postprocessing/plot_results.py --solver all --show
+```

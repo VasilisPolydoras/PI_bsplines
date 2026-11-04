@@ -6,6 +6,7 @@ import argparse
 import json
 import random
 import sys
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -137,38 +138,6 @@ def basis_and_derivatives(
     return basis, first, second
 
 
-def greville_abscissae(
-    knots: torch.Tensor, degree: int
-) -> torch.Tensor:
-    """Return one Greville abscissa for every B-spline basis function."""
-    n_basis = knots.numel() - degree - 1
-    greville = torch.stack(
-        [
-            knots[index + 1 : index + degree + 1].mean()
-            for index in range(n_basis)
-        ]
-    )
-    # An open clamped vector has endpoint Greville points. Set them exactly
-    # so CUDA float32 averaging cannot round them outside the knot interval.
-    greville[0] = knots[degree]
-    greville[-1] = knots[-degree - 1]
-    return greville
-
-
-def interpolate_boundary_trace(
-    knots: torch.Tensor,
-    degree: int,
-    physical_points: torch.Tensor,
-    boundary_function,
-) -> torch.Tensor:
-    """Interpolate prescribed boundary data at the Greville abscissae."""
-    greville = greville_abscissae(knots, degree)
-    interpolation_matrix = basis_matrix(greville, knots, degree)
-    return torch.linalg.solve(
-        interpolation_matrix, boundary_function(physical_points)
-    )
-
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "bspline_config.json"
 
@@ -203,10 +172,12 @@ N_BASIS_X = int(CONFIG["model"]["n_basis_x"])
 N_BASIS_T = int(CONFIG["model"]["n_basis_t"])
 DEGREE = int(CONFIG["model"]["degree"])
 SPATIAL_CLUSTERING = float(CONFIG["model"]["spatial_clustering"])
+INTERIOR_INITIALIZATION = str(
+    CONFIG["model"].get("interior_initialization", "random")
+).lower()
 N_INTERIOR_POINTS = int(CONFIG["sampling"]["interior_points"])
-N_BOUNDARY_POINTS_PER_EDGE = int(
-    CONFIG["sampling"]["boundary_points_per_edge"]
-)
+N_INITIAL_POINTS = int(CONFIG["sampling"]["initial_points"])
+N_VALIDATION_POINTS = int(CONFIG["sampling"]["validation_points"])
 PLOT_SPATIAL_POINTS = int(CONFIG["sampling"]["plot_spatial_points"])
 PLOT_TIME_POINTS = int(CONFIG["sampling"]["plot_time_points"])
 REFERENCE_SPATIAL_POINTS = int(
@@ -244,24 +215,36 @@ class BurgersBSpline:
         degree,
         device=None,
         spatial_clustering=SPATIAL_CLUSTERING,
+        interior_initialization=INTERIOR_INITIALIZATION,
     ):
         device = torch.device("cpu") if device is None else torch.device(device)
         self.n_basis_x = n_basis_x
         self.n_basis_t = n_basis_t
         self.degree = degree
         self.spatial_clustering = spatial_clustering
+        self.interior_initialization = str(interior_initialization).lower()
+        valid_initializations = {"random", "coons"}
+        if self.interior_initialization not in valid_initializations:
+            choices = ", ".join(sorted(valid_initializations))
+            raise ValueError(
+                "interior_initialization must be one of "
+                f"{{{choices}}}, got '{interior_initialization}'"
+            )
         self.knot_x = self._clamped_knots(
             X_BOUNDS, n_basis_x, device, clustering=spatial_clustering
         )
         self.knot_t = self._clamped_knots(
             T_BOUNDS, n_basis_t, device, clustering=0.0
         )
-        self.coeffs = torch.rand(
+        # Start the initial-condition fitting stage from the neutral zero
+        # field. The homogeneous spatial boundary rows remain exactly zero.
+        # The unknown PDE-interior coefficients are initialized separately
+        # after the initial-condition fit.
+        self.coeffs = torch.zeros(
             n_basis_x, n_basis_t, device=device, requires_grad=True
         )
         self.fixed_coeffs = None
         self.interior_coeffs = None
-        self.set_boundary_coefficients(self._build_boundary_coefficients())
 
     def _clamped_knots(self, bounds, n_basis, device, clustering):
         return clamped_knots(
@@ -283,48 +266,81 @@ class BurgersBSpline:
         coefficients[1:-1, 1:] = self.interior_coeffs
         return coefficients
 
-    def _build_boundary_coefficients(self):
-        """Interpolate and freeze the three prescribed Dirichlet traces."""
-        x_greville = greville_abscissae(self.knot_x, self.degree)
-        t_greville = greville_abscissae(self.knot_t, self.degree)
-        initial_trace = interpolate_boundary_trace(
-            self.knot_x, self.degree, x_greville, initial_condition
-        )
-        zero_trace = lambda coordinate: torch.zeros_like(coordinate)
-        left_trace = interpolate_boundary_trace(
-            self.knot_t, self.degree, t_greville, zero_trace
-        )
-        right_trace = interpolate_boundary_trace(
-            self.knot_t, self.degree, t_greville, zero_trace
-        )
+    def trained_condition_coefficients(self):
+        """Freeze the fitted IC column and impose both spatial BCs exactly."""
         fixed = torch.zeros_like(self.coeffs)
-        fixed[:, 0] = initial_trace
-        fixed[0, :] = left_trace
-        fixed[-1, :] = right_trace
+        fixed[1:-1, 0] = self.coeffs[1:-1, 0]
         return fixed.detach()
 
-    def set_boundary_coefficients(self, fixed_coefficients):
-        """Freeze x=-1, x=1 and t=0, then initialize a fresh PDE interior."""
+    def set_condition_coefficients(self, fixed_coefficients):
+        """Freeze t=0, keep x-boundary rows zero, and initialize the interior."""
         if fixed_coefficients.shape != self.coeffs.shape:
             raise ValueError(
                 f"Expected shape {tuple(self.coeffs.shape)}, "
                 f"got {tuple(fixed_coefficients.shape)}"
             )
         self.fixed_coeffs = fixed_coefficients.detach().clone()
-        time_fraction = torch.linspace(
-            0,
-            1,
-            self.n_basis_t,
-            device=fixed_coefficients.device,
-            dtype=fixed_coefficients.dtype,
+        initialization = self._initialize_full_coefficient_tensor(
+            self.fixed_coeffs
         )
-        decay = torch.exp(-VISCOSITY * np.pi**2 * time_fraction)
-        initialization = fixed_coefficients[:, 0:1] * decay[None, :]
-        initialization[0, :] = fixed_coefficients[0, :]
-        initialization[-1, :] = fixed_coefficients[-1, :]
         self.interior_coeffs = (
             initialization[1:-1, 1:].detach().clone().requires_grad_(True)
         )
+
+    def _initialize_full_coefficient_tensor(self, fixed_coefficients):
+        """Initialize free coefficients using the configured strategy."""
+        if self.interior_initialization == "random":
+            initialization = fixed_coefficients.clone()
+            free = torch.empty(
+                self.n_basis_x - 2,
+                self.n_basis_t - 1,
+                device=fixed_coefficients.device,
+                dtype=fixed_coefficients.dtype,
+            )
+            torch.nn.init.xavier_normal_(free)
+            initialization[1:-1, 1:] = free
+            return initialization
+
+        return self._coons_initialization(fixed_coefficients)
+
+    def _coons_initialization(self, fixed_coefficients):
+        """Extend the three prescribed traces with a Coons coefficient patch.
+
+        Burgers has no prescribed t=t_max trace.  The missing top trace is
+        therefore the linear interpolation of its two known corner values.
+        It is used only as an initial guess and is not frozen during training.
+        """
+        dtype = fixed_coefficients.dtype
+        device = fixed_coefficients.device
+        s = torch.linspace(0.0, 1.0, self.n_basis_x, device=device, dtype=dtype)
+        t = torch.linspace(0.0, 1.0, self.n_basis_t, device=device, dtype=dtype)
+        sx = s[:, None]
+        ty = t[None, :]
+
+        left = fixed_coefficients[0, :][None, :]
+        right = fixed_coefficients[-1, :][None, :]
+        bottom = fixed_coefficients[:, 0][:, None]
+        top = (
+            (1.0 - s) * fixed_coefficients[0, -1]
+            + s * fixed_coefficients[-1, -1]
+        )[:, None]
+        corners = (
+            (1.0 - sx) * (1.0 - ty) * fixed_coefficients[0, 0]
+            + (1.0 - sx) * ty * fixed_coefficients[0, -1]
+            + sx * (1.0 - ty) * fixed_coefficients[-1, 0]
+            + sx * ty * fixed_coefficients[-1, -1]
+        )
+        initialization = (
+            (1.0 - sx) * left
+            + sx * right
+            + (1.0 - ty) * bottom
+            + ty * top
+            - corners
+        )
+        initialization[0, :] = fixed_coefficients[0, :]
+        initialization[-1, :] = fixed_coefficients[-1, :]
+        initialization[:, 0] = fixed_coefficients[:, 0]
+        return initialization
 
     def forward(self, points):
         bx = self.basis_matrix(points[:, 0], self.knot_x)
@@ -343,17 +359,10 @@ def sample_interior(n_points, device, generator=None):
     return unit
 
 
-def sample_boundary(points_per_edge, device):
-    x = torch.linspace(*X_BOUNDS, points_per_edge, device=device)
-    t = torch.linspace(*T_BOUNDS, points_per_edge, device=device)
+def sample_initial_condition(n_points, device):
+    x = torch.linspace(*X_BOUNDS, n_points, device=device)
     initial = torch.stack((x, torch.zeros_like(x)), dim=1)
-    left = torch.stack((torch.full_like(t, X_BOUNDS[0]), t), dim=1)
-    right = torch.stack((torch.full_like(t, X_BOUNDS[1]), t), dim=1)
-    points = torch.cat((initial, left, right), dim=0)
-    targets = torch.cat(
-        (initial_condition(x), torch.zeros_like(t), torch.zeros_like(t))
-    )
-    return points, targets
+    return initial, initial_condition(x)
 
 
 def precompute_operators(model, points):
@@ -378,22 +387,58 @@ def boundary_loss(model, boundary_points, boundary_targets):
     return (model.forward(boundary_points) - boundary_targets).square().mean()
 
 
-def interpolate_boundary_coefficients(
-    n_basis_x,
-    n_basis_t,
-    degree,
-    device,
-    spatial_clustering=SPATIAL_CLUSTERING,
+def precompute_initial_operators(model, initial_points):
+    """Precompute tensor-product basis values for IC pretraining."""
+    with torch.no_grad():
+        bx = model.basis_matrix(initial_points[:, 0], model.knot_x)
+        bt = model.basis_matrix(initial_points[:, 1], model.knot_t)
+    return bx, bt
+
+
+def precomputed_initial_loss(coefficients, operators, initial_targets):
+    bx, bt = operators
+    prediction = torch.einsum("ni,ij,nj->n", bx, coefficients, bt)
+    return (prediction - initial_targets).square().mean()
+
+
+def pretrain_initial_coefficients(
+    model,
+    initial_points,
+    initial_targets,
+    *,
+    epochs,
+    learning_rate,
+    scheduler_factor,
+    scheduler_patience,
+    minimum_learning_rate,
+    early_stopping_patience,
+    min_delta,
+    print_every,
 ):
-    """Return the hard boundary coefficients constructed by a model."""
-    model = BurgersBSpline(
-        n_basis_x,
-        n_basis_t,
-        degree,
-        device,
-        spatial_clustering=spatial_clustering,
+    """Fit and freeze the IC trace while keeping spatial BC rows at zero."""
+    operators = precompute_initial_operators(model, initial_points)
+    optimizer = torch.optim.Adam([model.coeffs], lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=scheduler_factor,
+        patience=scheduler_patience,
+        min_lr=minimum_learning_rate,
     )
-    return model.fixed_coeffs.detach().clone()
+    history = train(
+        [model.coeffs],
+        lambda: precomputed_initial_loss(
+            model.coeffs, operators, initial_targets
+        ),
+        optimizer,
+        epochs=epochs,
+        scheduler=scheduler,
+        early_stopping_patience=early_stopping_patience,
+        min_delta=min_delta,
+        print_every=print_every,
+    )
+    model.set_condition_coefficients(model.trained_condition_coefficients())
+    return history
 
 
 def burgers_pde_loss(model, operators, viscosity=VISCOSITY):
@@ -541,8 +586,14 @@ def main(
     spatial_clustering=SPATIAL_CLUSTERING,
     interior_epochs=INTERIOR_EPOCHS,
     use_tuned=None,
+    interior_initialization=INTERIOR_INITIALIZATION,
+    initialization_seed=SEED,
+    sampling_seed=SEED,
+    validation_seed=None,
+    save_outputs=True,
+    verbose=True,
 ):
-    set_seed(SEED)
+    set_seed(initialization_seed)
     device = select_device(device_name)
     should_load = (
         LOAD_TUNED_IF_AVAILABLE and HYPERPARAMETER_PATH.exists()
@@ -559,26 +610,58 @@ def main(
     print(
         "Using tuned B-splines: "
         f"n_basis_x={n_basis_x}, n_basis_t={n_basis_t}, degree={degree}, "
-        f"spatial_clustering={spatial_clustering}"
+        f"spatial_clustering={spatial_clustering}, "
+        f"interior_initialization={interior_initialization}"
     )
 
-    interior = sample_interior(N_INTERIOR_POINTS, device)
-    boundary_points, boundary_targets = sample_boundary(
-        N_BOUNDARY_POINTS_PER_EDGE, device
+    generator = torch.Generator(device=device).manual_seed(sampling_seed)
+    interior = sample_interior(N_INTERIOR_POINTS, device, generator)
+    initial_points, initial_targets = sample_initial_condition(
+        N_INITIAL_POINTS, device
     )
 
-    print("Imposing initial and boundary conditions by Greville interpolation")
+    print(
+        "Pretraining the initial-condition coefficients from "
+        f"{N_INITIAL_POINTS} samples; spatial BCs are exact"
+    )
     model = BurgersBSpline(
         n_basis_x,
         n_basis_t,
         degree,
         device,
         spatial_clustering=spatial_clustering,
+        interior_initialization=interior_initialization,
+    )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    training_start = time.perf_counter()
+    initial_history = pretrain_initial_coefficients(
+        model,
+        initial_points,
+        initial_targets,
+        epochs=interior_epochs,
+        learning_rate=INTERIOR_LEARNING_RATE,
+        scheduler_factor=SCHEDULER_FACTOR,
+        scheduler_patience=SCHEDULER_PATIENCE,
+        minimum_learning_rate=MIN_LEARNING_RATE,
+        early_stopping_patience=EARLY_STOPPING_PATIENCE,
+        min_delta=MIN_DELTA,
+        print_every=PRINT_EVERY,
     )
     operators = precompute_operators(model, interior)
     print(
-        f"Frozen boundary loss: "
-        f"{boundary_loss(model, boundary_points, boundary_targets).item():.6e}"
+        f"Frozen initial-condition loss: "
+        f"{boundary_loss(model, initial_points, initial_targets).item():.6e}"
+    )
+    with torch.no_grad():
+        coefficients = model.coefficient_tensor()
+        boundary_coefficient_max = torch.maximum(
+            coefficients[0, :].abs().max(),
+            coefficients[-1, :].abs().max(),
+        ).item()
+    print(
+        "Maximum absolute spatial-boundary coefficient: "
+        f"{boundary_coefficient_max:.6e}"
     )
 
     print("Optimizing interior coefficients with PDE residual only")
@@ -603,10 +686,42 @@ def main(
         min_delta=MIN_DELTA,
         print_every=PRINT_EVERY,
     )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    training_wall_time = time.perf_counter() - training_start
     print(
-        f"Boundary loss after PDE training: "
-        f"{boundary_loss(model, boundary_points, boundary_targets).item():.6e}"
+        "Total training wall time "
+        f"(IC pretraining + interior PDE): {training_wall_time:.3f} s"
     )
+    print(
+        f"Initial-condition loss after PDE training: "
+        f"{boundary_loss(model, initial_points, initial_targets).item():.6e}"
+    )
+
+    validation_generator = (
+        generator
+        if validation_seed is None
+        else torch.Generator(device=device).manual_seed(validation_seed)
+    )
+    validation = sample_interior(
+        N_VALIDATION_POINTS, device, validation_generator
+    )
+    print("Computing validation reference solution")
+    validation_reference = numerical_reference_at_points(validation)
+    with torch.no_grad():
+        validation_prediction = model.forward(validation)
+    relative_error = (
+        torch.linalg.vector_norm(validation_prediction - validation_reference)
+        / torch.linalg.vector_norm(validation_reference)
+    ).item()
+    print(f"Relative validation L2 error: {relative_error:.6e}")
+
+    result = {
+        "validation_relative_l2_error": relative_error,
+        "training_time_seconds": training_wall_time,
+    }
+    if not save_outputs:
+        return result
 
     x = np.linspace(*X_BOUNDS, PLOT_SPATIAL_POINTS)
     times = np.linspace(*T_BOUNDS, PLOT_TIME_POINTS)
@@ -620,8 +735,10 @@ def main(
         prediction = model.forward(points).cpu().numpy().reshape(gx.shape)
     reference = numerical_reference(x, times)
     error = np.abs(prediction - reference)
-    relative_error = np.linalg.norm(prediction - reference) / np.linalg.norm(reference)
-    print(f"Relative L2 error against numerical reference: {relative_error:.6e}")
+    grid_relative_error = (
+        np.linalg.norm(prediction - reference) / np.linalg.norm(reference)
+    )
+    print(f"Relative plot-grid L2 error: {grid_relative_error:.6e}")
 
     POSTPROCESSING_DIR.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -632,11 +749,17 @@ def main(
         reference=reference,
         absolute_error=error,
         validation_relative_l2_error=np.asarray(relative_error, dtype=float),
+        validation_points=validation.detach().cpu().numpy(),
+        validation_prediction=validation_prediction.detach().cpu().numpy(),
+        validation_reference=validation_reference.detach().cpu().numpy(),
+        plot_grid_relative_l2_error=np.asarray(grid_relative_error, dtype=float),
         viscosity=np.asarray(VISCOSITY, dtype=float),
         n_basis_x=np.asarray(n_basis_x, dtype=int),
         n_basis_t=np.asarray(n_basis_t, dtype=int),
         degree=np.asarray(degree, dtype=int),
         spatial_clustering=np.asarray(spatial_clustering, dtype=float),
+        interior_initialization=np.asarray(interior_initialization),
+        training_wall_time_seconds=np.asarray(training_wall_time, dtype=float),
     )
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
@@ -660,12 +783,31 @@ def main(
     print(f"Saved solution data to: {SOLUTION_DATA_PATH}")
     print(f"Saved solution plot to: {SOLUTION_PLOT_PATH}")
 
+    initial_loss_values = np.asarray(initial_history, dtype=float)
+    initial_epoch_values = np.arange(1, initial_loss_values.size + 1)
     loss_values = np.asarray(history, dtype=float)
     epoch_values = np.arange(1, loss_values.size + 1)
     np.savez_compressed(
-        TRAINING_DATA_PATH, epoch=epoch_values, loss=loss_values
+        TRAINING_DATA_PATH,
+        initial_epoch=initial_epoch_values,
+        initial_loss=initial_loss_values,
+        # Retain the former names for postprocessing compatibility.
+        boundary_epoch=initial_epoch_values,
+        boundary_loss=initial_loss_values,
+        interior_epoch=epoch_values,
+        interior_loss=loss_values,
+        # Retain the original names for postprocessing compatibility.
+        epoch=epoch_values,
+        loss=loss_values,
+        interior_initialization=np.asarray(interior_initialization),
+        training_wall_time_seconds=np.asarray(training_wall_time, dtype=float),
     )
     training_figure, training_axis = plt.subplots(figsize=(6, 4))
+    training_axis.plot(
+        initial_epoch_values,
+        initial_loss_values,
+        label="Initial-condition pretraining",
+    )
     training_axis.plot(epoch_values, loss_values, label="Interior PDE training")
     training_axis.set_yscale("log")
     training_axis.set_xlabel("Epochs")
@@ -683,6 +825,7 @@ def main(
     else:
         plt.close(fig)
         plt.close(training_figure)
+    return result
 
 
 if __name__ == "__main__":

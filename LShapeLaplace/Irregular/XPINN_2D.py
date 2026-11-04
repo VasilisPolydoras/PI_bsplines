@@ -16,6 +16,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -362,8 +363,14 @@ def main(
     corner_epsilon: float = CORNER_EPSILON,
     epochs: int = EPOCHS,
     use_tuned: bool | None = None,
-) -> None:
-    set_seed(SEED)
+    initialization_seed: int = SEED,
+    sampling_seed: int = SEED,
+    validation_seed: int | None = None,
+    save_outputs: bool = True,
+    verbose: bool = True,
+) -> dict[str, float]:
+    """Train once and return validation error and training wall time."""
+    set_seed(initialization_seed)
     device = select_device(device_name)
     should_load = (
         LOAD_TUNED_IF_AVAILABLE and RESULT_PATH.exists()
@@ -372,22 +379,25 @@ def main(
     )
     if should_load:
         n_layers, n_neurons = load_hyperparameters()
-        print(f"Loaded tuned hyperparameters from: {RESULT_PATH}")
-    print(f"Using device: {device}")
-    print(f"Loaded configuration from: {CONFIG_PATH}")
+        if verbose:
+            print(f"Loaded tuned hyperparameters from: {RESULT_PATH}")
+    if verbose:
+        print(f"Using device: {device}")
+        print(f"Loaded configuration from: {CONFIG_PATH}")
     if ACTIVATION.lower() != "tanh":
         raise ValueError(
             f"Unsupported activation '{ACTIVATION}'; expected 'tanh'"
         )
-    print(
-        "Irregular XPINN subnetworks: "
-        f"layers={n_layers}, neurons={n_neurons}, activation={ACTIVATION}, "
-        f"corner_epsilon={corner_epsilon:g}"
-    )
-    print("Exterior Dirichlet values are imposed exactly by the trial functions.")
+    if verbose:
+        print(
+            "Irregular XPINN subnetworks: "
+            f"layers={n_layers}, neurons={n_neurons}, activation={ACTIVATION}, "
+            f"corner_epsilon={corner_epsilon:g}"
+        )
+        print("Exterior Dirichlet values are imposed exactly by the trial functions.")
 
     model = LShapeXPINN(n_layers, n_neurons).to(device)
-    generator = torch.Generator(device=device).manual_seed(SEED)
+    generator = torch.Generator(device=device).manual_seed(sampling_seed)
     interior = sample_interior_points(
         N_INTERIOR_POINTS_PER_PATCH, device, generator
     )
@@ -417,6 +427,9 @@ def main(
         patience=SCHEDULER_PATIENCE,
         min_lr=MIN_LEARNING_RATE,
     )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    training_start = time.perf_counter()
     loss_history = train(
         model.parameters(),
         loss_fn,
@@ -425,51 +438,69 @@ def main(
         scheduler=scheduler,
         early_stopping_patience=EARLY_STOPPING_PATIENCE,
         min_delta=MIN_DELTA,
-        print_every=PRINT_EVERY,
+        print_every=PRINT_EVERY if verbose else 0,
     )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    training_time_seconds = time.perf_counter() - training_start
 
+    validation_generator = (
+        generator
+        if validation_seed is None
+        else torch.Generator(device=device).manual_seed(validation_seed)
+    )
     validation = sample_interior_points(
-        N_VALIDATION_POINTS_PER_PATCH, device, generator
-    )
-    validation_interfaces = generate_interface_points(
-        N_VALIDATION_INTERFACE_POINTS, device, corner_epsilon
-    )
-    validation_boundary = generate_boundary_points(
-        N_VALIDATION_BOUNDARY_POINTS_PER_EDGE, device
+        N_VALIDATION_POINTS_PER_PATCH, device, validation_generator
     )
     relative_error = relative_l2_error(model, validation)
-    residual_mse = torch.stack(
-        [
-            laplace_residual(model, name, validation[name])
-            .detach()
-            .square()
-            .mean()
-            for name in model.patch_names
-        ]
-    ).mean()
-    boundary_error = maximum_boundary_error(model, validation_boundary)
-    solution_jump, residual_jump, flux_jump = interface_diagnostics(
-        model, validation_interfaces
-    )
-    print(f"Relative L2 error: {relative_error.item():.6e}")
-    print(f"Interior Laplace residual MSE: {residual_mse.item():.6e}")
-    print(f"Maximum boundary error: {boundary_error.item():.6e}")
-    print(f"Maximum interface solution jump: {solution_jump.item():.6e}")
-    print(f"Maximum interface residual jump: {residual_jump.item():.6e}")
-    print(f"Maximum interface normal-flux jump: {flux_jump.item():.6e}")
-    plot_solution(
-        model,
-        postprocessing_dir=POSTPROCESSING_DIR,
-        resolution=PLOT_RESOLUTION,
-        validation_relative_l2_error=relative_error,
-    )
-    plot_training_history(
-        loss_history, model, postprocessing_dir=POSTPROCESSING_DIR
-    )
-    if SHOW_PLOTS:
-        plt.show()
-    else:
-        plt.close("all")
+    if verbose:
+        validation_interfaces = generate_interface_points(
+            N_VALIDATION_INTERFACE_POINTS, device, corner_epsilon
+        )
+        validation_boundary = generate_boundary_points(
+            N_VALIDATION_BOUNDARY_POINTS_PER_EDGE, device
+        )
+        residual_mse = torch.stack(
+            [
+                laplace_residual(model, name, validation[name])
+                .detach()
+                .square()
+                .mean()
+                for name in model.patch_names
+            ]
+        ).mean()
+        boundary_error = maximum_boundary_error(model, validation_boundary)
+        solution_jump, residual_jump, flux_jump = interface_diagnostics(
+            model, validation_interfaces
+        )
+        print(f"Relative L2 error: {relative_error.item():.6e}")
+        print(f"Interior Laplace residual MSE: {residual_mse.item():.6e}")
+        print(f"Maximum boundary error: {boundary_error.item():.6e}")
+        print(f"Maximum interface solution jump: {solution_jump.item():.6e}")
+        print(f"Maximum interface residual jump: {residual_jump.item():.6e}")
+        print(f"Maximum interface normal-flux jump: {flux_jump.item():.6e}")
+        print(f"Training wall time: {training_time_seconds:.6f} s")
+    if save_outputs:
+        plot_solution(
+            model,
+            postprocessing_dir=POSTPROCESSING_DIR,
+            resolution=PLOT_RESOLUTION,
+            validation_relative_l2_error=relative_error,
+        )
+        plot_training_history(
+            loss_history,
+            model,
+            postprocessing_dir=POSTPROCESSING_DIR,
+            training_time_seconds=training_time_seconds,
+        )
+        if SHOW_PLOTS:
+            plt.show()
+        else:
+            plt.close("all")
+    return {
+        "validation_relative_l2_error": relative_error.detach().cpu().item(),
+        "training_time_seconds": training_time_seconds,
+    }
 
 
 if __name__ == "__main__":
@@ -483,6 +514,18 @@ if __name__ == "__main__":
         "--corner-epsilon", type=float, default=CORNER_EPSILON
     )
     parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument(
+        "--seed", type=int, default=SEED,
+        help="Trainable-parameter initialization seed",
+    )
+    parser.add_argument(
+        "--sampling-seed", type=int, default=SEED,
+        help="Seed for the fixed interior collocation points",
+    )
+    parser.add_argument(
+        "--validation-seed", type=int, default=None,
+        help="Optional independent validation-set seed",
+    )
     tuned_group = parser.add_mutually_exclusive_group()
     tuned_group.add_argument("--use-tuned", dest="use_tuned", action="store_true")
     tuned_group.add_argument(
@@ -491,10 +534,13 @@ if __name__ == "__main__":
     parser.set_defaults(use_tuned=None)
     arguments = parser.parse_args()
     main(
-        arguments.device,
-        arguments.layers,
-        arguments.neurons,
-        arguments.corner_epsilon,
-        arguments.epochs,
-        arguments.use_tuned,
+        device_name=arguments.device,
+        n_layers=arguments.layers,
+        n_neurons=arguments.neurons,
+        corner_epsilon=arguments.corner_epsilon,
+        epochs=arguments.epochs,
+        use_tuned=arguments.use_tuned,
+        initialization_seed=arguments.seed,
+        sampling_seed=arguments.sampling_seed,
+        validation_seed=arguments.validation_seed,
     )

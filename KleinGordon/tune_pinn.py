@@ -18,7 +18,7 @@ from KleinGordon.PINN_3D import (
     CONFIG, CONSTRAINT_MODE, DEFAULT_DEVICE, LOSS_WEIGHTS, RESULT_PATH, SEED,
     KleinGordonPINN, pinn_loss,
 )
-from KleinGordon._common import relative_l2_error, sample_constraints, sample_interior, select_device, set_seed
+from KleinGordon.PINN_3D import relative_l2_error, sample_constraints, sample_interior, select_device, set_seed
 from training import train
 
 TUNING = CONFIG["tuning"]

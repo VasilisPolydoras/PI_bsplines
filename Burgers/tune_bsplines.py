@@ -19,7 +19,9 @@ from Burgers.Bspline_2D import (
     BurgersBSpline,
     burgers_pde_loss,
     numerical_reference_at_points,
+    pretrain_initial_coefficients,
     precompute_operators,
+    sample_initial_condition,
     sample_interior,
     select_device,
     set_seed,
@@ -58,6 +60,8 @@ def make_objective(
     train_points,
     validation_points,
     validation_reference,
+    initial_points,
+    initial_targets,
     device,
     tuning_epochs=TUNING_PDE_EPOCHS,
 ):
@@ -85,6 +89,19 @@ def make_objective(
             degree,
             device,
             spatial_clustering=spatial_clustering,
+        )
+        pretrain_initial_coefficients(
+            model,
+            initial_points,
+            initial_targets,
+            epochs=tuning_epochs,
+            learning_rate=INTERIOR_LEARNING_RATE,
+            scheduler_factor=TUNING_SCHEDULER_FACTOR,
+            scheduler_patience=TUNING_SCHEDULER_PATIENCE,
+            minimum_learning_rate=TUNING_MIN_LEARNING_RATE,
+            early_stopping_patience=TUNING_EARLY_STOPPING_PATIENCE,
+            min_delta=TUNING_MIN_DELTA,
+            print_every=0,
         )
         train_operators = precompute_operators(model, train_points)
         validation_operators = precompute_operators(model, validation_points)
@@ -138,6 +155,9 @@ def main(
     validation_points = sample_interior(
         N_VALIDATION_POINTS, device, generator
     )
+    initial_points, initial_targets = sample_initial_condition(
+        int(TUNING_CONFIG["initial_points"]), device
+    )
     print("Computing the validation reference solution once")
     validation_reference = numerical_reference_at_points(validation_points)
     study = run_tpe_study(
@@ -145,6 +165,8 @@ def main(
             train_points,
             validation_points,
             validation_reference,
+            initial_points,
+            initial_targets,
             device,
             tuning_epochs,
         ),

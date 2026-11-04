@@ -1,8 +1,8 @@
 """B-spline XPINN solver for the singular L-shaped Laplace benchmark.
 
-The three fitted patches impose exterior Dirichlet traces and C0 solution
-continuity through their coefficients. Patchwise Laplace residuals are coupled
-by residual-continuity and normal-flux losses across both interfaces.
+The homogeneous exterior Dirichlet traces are imposed exactly. The
+inhomogeneous exterior traces are pretrained and frozen before the remaining
+coefficients are trained with the patchwise Laplace and interface losses.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -23,8 +24,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from LShapeLaplace.Irregular._bspline_utils import (
     basis_derivative_matrix,
-    greville_abscissae,
-    interpolate_boundary_trace,
     select_device,
     set_seed,
 )
@@ -67,8 +66,14 @@ N_BASIS = int(CONFIG["model"]["n_basis"])
 DEGREE = int(CONFIG["model"]["degree"])
 KNOT_CONCENTRATION = float(CONFIG["model"]["knot_concentration"])
 CORNER_EPSILON = float(CONFIG["model"]["corner_epsilon"])
+INTERIOR_INITIALIZATION = str(
+    CONFIG["model"].get("interior_initialization", "random")
+).lower()
 N_INTERIOR_POINTS_PER_PATCH = int(
     CONFIG["sampling"]["interior_points_per_patch"]
+)
+N_BOUNDARY_POINTS_PER_EDGE = int(
+    CONFIG["sampling"]["boundary_points_per_edge"]
 )
 N_INTERFACE_POINTS = int(CONFIG["sampling"]["interface_points"])
 N_VALIDATION_POINTS_PER_PATCH = int(
@@ -171,6 +176,7 @@ class LShapeBSpline(torch.nn.Module):
         degree: int,
         knot_concentration: float,
         device: torch.device,
+        interior_initialization: str = INTERIOR_INITIALIZATION,
     ) -> None:
         super().__init__()
         if degree < 2:
@@ -180,6 +186,11 @@ class LShapeBSpline(torch.nn.Module):
         self.n_basis = n_basis
         self.degree = degree
         self.knot_concentration = knot_concentration
+        self.interior_initialization = interior_initialization.lower()
+        if self.interior_initialization not in {"random", "coons"}:
+            raise ValueError(
+                "interior_initialization must be 'random' or 'coons'"
+            )
         for axis in ("x", "y"):
             for endpoint in (0, 1):
                 self.register_buffer(
@@ -192,12 +203,18 @@ class LShapeBSpline(torch.nn.Module):
         for name in self.patch_names:
             self.register_parameter(
                 f"raw_{name}",
-                torch.nn.Parameter(torch.zeros(n_basis, n_basis, device=device)),
+                torch.nn.Parameter(
+                    torch.zeros(n_basis, n_basis, device=device)
+                ),
             )
-        #Register the fixed masks and values for each patch as buffers
-        masks, values = self._build_boundary_data(device)
+        # Exterior traces are split into exactly homogeneous edges and
+        # inhomogeneous edges that are fitted in a preprocessing stage.
+        masks, homogeneous_masks, values = self._build_boundary_data(device)
         for name in self.patch_names:
             self.register_buffer(f"{name}_fixed_mask", masks[name])
+            self.register_buffer(
+                f"{name}_homogeneous_mask", homogeneous_masks[name]
+            )
             self.register_buffer(f"{name}_fixed_values", values[name])
 
     @staticmethod
@@ -217,12 +234,14 @@ class LShapeBSpline(torch.nn.Module):
             getattr(self, f"knots_y_{endpoints[1]}"),
         )
 
-    # Fix the exterior BCs for each patch.
+    # Mark the exterior BC coefficient traces for each patch.
     def _build_boundary_data(self, device: torch.device):
         shapes = (self.n_basis, self.n_basis)
-
-        # Create masks and values for each patch, indicating which coefficients are fixed
         masks = {
+            name: torch.zeros(*shapes, dtype=torch.bool, device=device)
+            for name in self.patch_names
+        }
+        homogeneous_masks = {
             name: torch.zeros(*shapes, dtype=torch.bool, device=device)
             for name in self.patch_names
         }
@@ -230,51 +249,127 @@ class LShapeBSpline(torch.nn.Module):
             name: torch.zeros(*shapes, device=device)
             for name in self.patch_names
         }
-        # Assign the fixed coefficients for each patch based on the boundary conditions
-        def set_edge(name: str, edge: str) -> None:
-            knots_x, knots_y = self.patch_knots(name)
+
+        def mark_edge(
+            target: dict[str, torch.Tensor], name: str, edge: str
+        ) -> None:
             if edge in ("bottom", "top"):
-
-                # Greville abscissae are used to solve the local linear system for the 
-                # boundary coefficients. They are used in spline collocation methods to 
-                # evaluate the coefficients.
-                local_coordinate = greville_abscissae(knots_x, self.degree)
-                eta = 0.0 if edge == "bottom" else 1.0
-
-                # form the 2D local coordinates for the boundary edge of the patch
-                local = torch.stack(
-                    (local_coordinate, torch.full_like(local_coordinate, eta)), 1
-                )
-                # Trace are the coefficients after solving the local linear system for the boundary coefficients.
-                trace = interpolate_boundary_trace(
-                    knots_x, self.degree, map_patch(name, local), self.exact_solution
-                )
-                # Assign the fixed coefficients to the appropriate row of the patch's coefficient matrix
                 column = 0 if edge == "bottom" else -1
-                masks[name][:, column] = True
-                values[name][:, column] = trace
+                target[name][:, column] = True
             else:
-                # Similary assign the BC coefficients for the left and right edges of every patch
-                local_coordinate = greville_abscissae(knots_y, self.degree)
-                xi = 0.0 if edge == "left" else 1.0
-                local = torch.stack(
-                    (torch.full_like(local_coordinate, xi), local_coordinate), 1
-                )
-                trace = interpolate_boundary_trace(
-                    knots_y, self.degree, map_patch(name, local), self.exact_solution
-                )
                 row = 0 if edge == "left" else -1
-                masks[name][row, :] = True
-                values[name][row, :] = trace
+                target[name][row, :] = True
 
-        # Assign the fixed coefficients for each patch based on the L-shape geometry
         for edge in ("bottom", "right", "top"):
-            set_edge("upper_right", edge)
+            mark_edge(masks, "upper_right", edge)
         for edge in ("left", "top"):
-            set_edge("upper_left", edge)
+            mark_edge(masks, "upper_left", edge)
         for edge in ("left", "bottom", "right"):
-            set_edge("lower_left", edge)
-        return masks, values
+            mark_edge(masks, "lower_left", edge)
+
+        # These two re-entrant exterior traces are analytically zero.
+        mark_edge(homogeneous_masks, "upper_right", "bottom")
+        mark_edge(homogeneous_masks, "lower_left", "right")
+        return masks, homogeneous_masks, values
+
+    def boundary_candidate_tensors(self) -> dict[str, torch.Tensor]:
+        """Return coefficients used to fit the inhomogeneous exterior traces."""
+        candidates = {}
+        for name in self.patch_names:
+            raw = getattr(self, f"raw_{name}")
+            homogeneous = getattr(self, f"{name}_homogeneous_mask")
+            candidates[name] = torch.where(
+                homogeneous, torch.zeros_like(raw), raw
+            )
+        return candidates
+
+    def freeze_boundary_coefficients(self) -> None:
+        """Freeze fitted inhomogeneous traces while retaining exact zero edges."""
+        with torch.no_grad():
+            for name in self.patch_names:
+                fixed_mask = getattr(self, f"{name}_fixed_mask")
+                homogeneous = getattr(self, f"{name}_homogeneous_mask")
+                inhomogeneous = fixed_mask & ~homogeneous
+                fixed_values = getattr(self, f"{name}_fixed_values")
+                raw = getattr(self, f"raw_{name}")
+                fixed_values[inhomogeneous] = raw[inhomogeneous]
+                fixed_values[homogeneous] = 0.0
+
+    @staticmethod
+    def _coons_patch(
+        left: torch.Tensor,
+        right: torch.Tensor,
+        bottom: torch.Tensor,
+        top: torch.Tensor,
+    ) -> torch.Tensor:
+        """Construct a Coons blend from four compatible coefficient traces."""
+        n_basis = left.numel()
+        s = torch.linspace(
+            0.0, 1.0, n_basis, device=left.device, dtype=left.dtype
+        )
+        t = torch.linspace(
+            0.0, 1.0, n_basis, device=left.device, dtype=left.dtype
+        )
+        sx, ty = s[:, None], t[None, :]
+        corners = (
+            (1.0 - sx) * (1.0 - ty) * bottom[0]
+            + (1.0 - sx) * ty * top[0]
+            + sx * (1.0 - ty) * bottom[-1]
+            + sx * ty * top[-1]
+        )
+        return (
+            (1.0 - sx) * left[None, :]
+            + sx * right[None, :]
+            + (1.0 - ty) * bottom[:, None]
+            + ty * top[:, None]
+            - corners
+        )
+
+    def initialize_free_coefficients(self) -> None:
+        """Initialize coefficients left free after boundary pretraining."""
+        with torch.no_grad():
+            if self.interior_initialization == "random":
+                for name in self.patch_names:
+                    torch.nn.init.xavier_normal_(getattr(self, f"raw_{name}"))
+                return
+
+            fixed = {
+                name: getattr(self, f"{name}_fixed_values")
+                for name in self.patch_names
+            }
+            parameter = torch.linspace(
+                0.0,
+                1.0,
+                self.n_basis,
+                device=self.raw_upper_right.device,
+                dtype=self.raw_upper_right.dtype,
+            )
+
+            # Initialize the patches in interface-dependency order. Missing
+            # interface traces are first completed linearly between their
+            # already known endpoint coefficients.
+            ur = fixed["upper_right"]
+            ur_left = torch.lerp(ur[0, 0], ur[0, -1], parameter)
+            initialized_ur = self._coons_patch(
+                ur_left, ur[-1, :], ur[:, 0], ur[:, -1]
+            )
+
+            ul = fixed["upper_left"]
+            ul_right = initialized_ur[0, :]
+            ul_bottom = torch.lerp(ul[0, 0], ul_right[0], parameter)
+            initialized_ul = self._coons_patch(
+                ul[0, :], ul_right, ul_bottom, ul[:, -1]
+            )
+
+            ll = fixed["lower_left"]
+            ll_top = initialized_ul[:, 0]
+            initialized_ll = self._coons_patch(
+                ll[0, :], ll[-1, :], ll[:, 0], ll_top
+            )
+
+            self.raw_upper_right.copy_(initialized_ur)
+            self.raw_upper_left.copy_(initialized_ul)
+            self.raw_lower_left.copy_(initialized_ll)
 
     # Impose the BC fixed coefficients on the raw trainable coefficients to get 
     # the final coefficient tensors for each patch.
@@ -361,6 +456,90 @@ def precompute_operators(
         name: model.operators_for_patch(name, local_points, max_order)
         for name in model.patch_names
     }
+
+
+def generate_inhomogeneous_boundary_local_points(
+    points_per_edge: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Return fixed samples on the six nonzero exterior boundary edges."""
+    if points_per_edge < 2:
+        raise ValueError("boundary_points_per_edge must be at least 2")
+    line = torch.linspace(0.0, 1.0, points_per_edge, device=device)
+    zero, one = torch.zeros_like(line), torch.ones_like(line)
+    return {
+        "upper_right": torch.cat(
+            (torch.stack((one, line), 1), torch.stack((line, one), 1)),
+            dim=0,
+        ),
+        "upper_left": torch.cat(
+            (torch.stack((zero, line), 1), torch.stack((line, one), 1)),
+            dim=0,
+        ),
+        "lower_left": torch.cat(
+            (torch.stack((zero, line), 1), torch.stack((line, zero), 1)),
+            dim=0,
+        ),
+    }
+
+
+def precompute_boundary_operators(
+    model: LShapeBSpline,
+    boundary_points: dict[str, torch.Tensor],
+):
+    """Precompute zeroth-order operators for boundary pretraining."""
+    return {
+        name: model.operators_for_patch(name, boundary_points[name], 0)
+        for name in model.patch_names
+    }
+
+
+def inhomogeneous_boundary_loss(
+    model: LShapeBSpline,
+    boundary_points: dict[str, torch.Tensor],
+    boundary_operators,
+) -> torch.Tensor:
+    """Return the mean fitting loss on all inhomogeneous exterior edges."""
+    coefficients = model.boundary_candidate_tensors()
+    losses = []
+    for name in model.patch_names:
+        prediction = model.evaluate(coefficients[name], boundary_operators[name])
+        target = model.exact_solution(map_patch(name, boundary_points[name]))
+        losses.append(prediction.sub(target).square().mean())
+    return torch.stack(losses).mean()
+
+
+def pretrain_boundary_coefficients(
+    model: LShapeBSpline,
+    boundary_points: dict[str, torch.Tensor],
+    boundary_operators,
+    epochs: int,
+    print_every: int = 0,
+) -> list[float]:
+    """Fit and freeze the nonzero Dirichlet coefficient traces."""
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=SCHEDULER_FACTOR,
+        patience=SCHEDULER_PATIENCE,
+        min_lr=MIN_LEARNING_RATE,
+    )
+    history = train(
+        model.parameters(),
+        lambda: inhomogeneous_boundary_loss(
+            model, boundary_points, boundary_operators
+        ),
+        optimizer,
+        epochs=epochs,
+        scheduler=scheduler,
+        early_stopping_patience=EARLY_STOPPING_PATIENCE,
+        min_delta=MIN_DELTA,
+        print_every=print_every,
+    )
+    model.freeze_boundary_coefficients()
+    model.initialize_free_coefficients()
+    return history
 
 
 def patch_operators(operators, patch_name: str):
@@ -759,19 +938,39 @@ def plot_training_history(
     loss_history: list[float],
     model: LShapeBSpline,
     postprocessing_dir: Path,
+    training_time_seconds: float,
+    boundary_loss_history: list[float] | None = None,
 ) -> None:
-    """Save the loss history as both numerical data and a figure."""
+    """Save boundary-pretraining and interior-training loss histories."""
     postprocessing_dir.mkdir(parents=True, exist_ok=True)
     loss = np.asarray(loss_history, dtype=float)
     epochs = np.arange(1, loss.size + 1)
+    boundary_loss = np.asarray(boundary_loss_history or [], dtype=float)
+    boundary_epochs = np.arange(1, boundary_loss.size + 1)
     data_path = postprocessing_dir / f"{model.output_stem}_training_data.npz"
-    np.savez_compressed(data_path, epoch=epochs, loss=loss)
+    np.savez_compressed(
+        data_path,
+        epoch=epochs,
+        loss=loss,
+        boundary_epoch=boundary_epochs,
+        boundary_loss=boundary_loss,
+        interior_epoch=epochs,
+        interior_loss=loss,
+        training_time_seconds=np.asarray(training_time_seconds, dtype=float),
+    )
 
     figure, axis = plt.subplots(figsize=(6, 4))
-    axis.semilogy(epochs, loss)
+    if boundary_loss.size:
+        axis.semilogy(
+            boundary_epochs,
+            boundary_loss,
+            label="Dirichlet pretraining",
+        )
+    axis.semilogy(epochs, loss, label="PDE/interface training")
     axis.set_xlabel("Epoch")
     axis.set_ylabel("B-spline XPINN loss")
     axis.set_title(f"{model.solution_title} training history")
+    axis.legend()
     figure.tight_layout()
     figure_path = postprocessing_dir / f"{model.output_stem}_training.png"
     figure.savefig(figure_path, dpi=300, bbox_inches="tight")
@@ -799,10 +998,23 @@ def main(
     degree: int = DEGREE,
     knot_concentration: float = KNOT_CONCENTRATION,
     corner_epsilon: float = CORNER_EPSILON,
+    interior_initialization: str = INTERIOR_INITIALIZATION,
     epochs: int = EPOCHS,
     use_tuned: bool | None = None,
-) -> None:
-    set_seed(SEED)
+    initialization_seed: int = SEED,
+    sampling_seed: int = SEED,
+    validation_seed: int | None = None,
+    save_outputs: bool = True,
+    verbose: bool = True,
+) -> dict[str, float]:
+    """Train once and return validation error and training wall time.
+
+    Separate seeds allow statistical studies to vary model initialization
+    while keeping training and validation samples fixed. The B-spline model
+    uses Xavier-normal coefficient initialization controlled by
+    ``initialization_seed``.
+    """
+    set_seed(initialization_seed)
     device = select_device(device_name)
     should_load = (
         LOAD_TUNED_IF_AVAILABLE and RESULT_PATH.exists()
@@ -811,20 +1023,31 @@ def main(
     )
     if should_load:
         n_basis, degree = load_hyperparameters()
-        print(f"Loaded tuned hyperparameters from: {RESULT_PATH}")
-    print(f"Using device: {device}")
-    print(f"Loaded configuration from: {CONFIG_PATH}")
-    print(
-        "Irregular B-spline XPINN: "
-        f"n_basis={n_basis}, degree={degree}, "
-        f"knot_concentration={knot_concentration:g}, "
-        f"corner_epsilon={corner_epsilon:g}"
-    )
-    print("Exterior Dirichlet values and C0 interfaces are imposed exactly.")
-    print("The soft interface terms are residual and normal-flux continuity.")
+        if verbose:
+            print(f"Loaded tuned hyperparameters from: {RESULT_PATH}")
+    if verbose:
+        print(f"Using device: {device}")
+        print(f"Loaded configuration from: {CONFIG_PATH}")
+        print(
+            "Irregular B-spline XPINN: "
+            f"n_basis={n_basis}, degree={degree}, "
+            f"knot_concentration={knot_concentration:g}, "
+            f"corner_epsilon={corner_epsilon:g}, "
+            f"interior_initialization={interior_initialization}"
+        )
+        print("Homogeneous exterior Dirichlet traces are imposed exactly.")
+        print("Inhomogeneous Dirichlet traces are pretrained and frozen.")
+        print("C0 interfaces are imposed exactly through shared coefficients.")
+        print("The soft interface terms are residual and normal-flux continuity.")
 
-    model = LShapeBSpline(n_basis, degree, knot_concentration, device)
-    generator = torch.Generator(device=device).manual_seed(SEED)
+    model = LShapeBSpline(
+        n_basis,
+        degree,
+        knot_concentration,
+        device,
+        interior_initialization,
+    )
+    generator = torch.Generator(device=device).manual_seed(sampling_seed)
     interior_points = sample_local_points(
         N_INTERIOR_POINTS_PER_PATCH, device, generator
     )
@@ -837,6 +1060,26 @@ def main(
     interface_operators = precompute_interface_operators(
         model, interface_points
     )
+
+    boundary_points = generate_inhomogeneous_boundary_local_points(
+        N_BOUNDARY_POINTS_PER_EDGE, device
+    )
+    boundary_operators = precompute_boundary_operators(model, boundary_points)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    training_start = time.perf_counter()
+    if verbose:
+        print("Stage 1/2: pretraining inhomogeneous Dirichlet traces")
+    boundary_loss_history = pretrain_boundary_coefficients(
+        model,
+        boundary_points,
+        boundary_operators,
+        epochs=epochs,
+        print_every=PRINT_EVERY if verbose else 0,
+    )
+    if verbose:
+        print("Stage 2/2: training the PDE and interface residuals")
 
     loss_fn = lambda: strong_residual_loss(
         model,
@@ -866,52 +1109,74 @@ def main(
         scheduler=scheduler,
         early_stopping_patience=EARLY_STOPPING_PATIENCE,
         min_delta=MIN_DELTA,
-        print_every=PRINT_EVERY,
+        print_every=PRINT_EVERY if verbose else 0,
     )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    training_time_seconds = time.perf_counter() - training_start
 
+    validation_generator = (
+        generator
+        if validation_seed is None
+        else torch.Generator(device=device).manual_seed(validation_seed)
+    )
     validation_points = sample_local_points(
-        N_VALIDATION_POINTS_PER_PATCH, device, generator
+        N_VALIDATION_POINTS_PER_PATCH, device, validation_generator
     )
     validation_operators = precompute_operators(
-        model, validation_points, max_order=2
-    )
-    validation_interfaces = generate_interface_local_points(
-        N_VALIDATION_INTERFACE_POINTS, device, corner_epsilon
-    )
-    validation_interface_operators = precompute_interface_operators(
-        model, validation_interfaces
+        model,
+        validation_points,
+        max_order=2 if (verbose or save_outputs) else 0,
     )
     with torch.no_grad():
         relative_error = relative_l2_error(
             model, validation_points, validation_operators
         )
-        residual = laplace_residual_loss(model, validation_operators)
-        boundary_error, solution_jump = boundary_and_interface_errors(model)
-        residual_jump = maximum_interface_residual_jump(
-            model, validation_interface_operators
+    if verbose:
+        validation_interfaces = generate_interface_local_points(
+            N_VALIDATION_INTERFACE_POINTS, device, corner_epsilon
         )
-        flux_jump = maximum_interface_flux_jump(
-            model, validation_interface_operators
+        validation_interface_operators = precompute_interface_operators(
+            model, validation_interfaces
         )
-    print(f"Relative L2 error: {relative_error.item():.6e}")
-    print(f"Interior Laplace residual MSE: {residual.item():.6e}")
-    print(f"Maximum boundary interpolation error: {boundary_error.item():.6e}")
-    print(f"Maximum interface solution jump: {solution_jump.item():.6e}")
-    print(f"Maximum interface residual jump: {residual_jump.item():.6e}")
-    print(f"Maximum interface normal-flux jump: {flux_jump.item():.6e}")
-    plot_solution(
-        model,
-        postprocessing_dir=POSTPROCESSING_DIR,
-        resolution=PLOT_RESOLUTION,
-        validation_relative_l2_error=relative_error,
-    )
-    plot_training_history(
-        loss_history, model, postprocessing_dir=POSTPROCESSING_DIR
-    )
-    if SHOW_PLOTS:
-        plt.show()
-    else:
-        plt.close("all")
+        with torch.no_grad():
+            residual = laplace_residual_loss(model, validation_operators)
+            boundary_error, solution_jump = boundary_and_interface_errors(model)
+            residual_jump = maximum_interface_residual_jump(
+                model, validation_interface_operators
+            )
+            flux_jump = maximum_interface_flux_jump(
+                model, validation_interface_operators
+            )
+        print(f"Relative L2 error: {relative_error.item():.6e}")
+        print(f"Interior Laplace residual MSE: {residual.item():.6e}")
+        print(f"Maximum frozen-boundary error: {boundary_error.item():.6e}")
+        print(f"Maximum interface solution jump: {solution_jump.item():.6e}")
+        print(f"Maximum interface residual jump: {residual_jump.item():.6e}")
+        print(f"Maximum interface normal-flux jump: {flux_jump.item():.6e}")
+        print(f"Training wall time: {training_time_seconds:.6f} s")
+    if save_outputs:
+        plot_solution(
+            model,
+            postprocessing_dir=POSTPROCESSING_DIR,
+            resolution=PLOT_RESOLUTION,
+            validation_relative_l2_error=relative_error,
+        )
+        plot_training_history(
+            loss_history,
+            model,
+            postprocessing_dir=POSTPROCESSING_DIR,
+            training_time_seconds=training_time_seconds,
+            boundary_loss_history=boundary_loss_history,
+        )
+        if SHOW_PLOTS:
+            plt.show()
+        else:
+            plt.close("all")
+    return {
+        "validation_relative_l2_error": relative_error.detach().cpu().item(),
+        "training_time_seconds": training_time_seconds,
+    }
 
 
 if __name__ == "__main__":
@@ -929,7 +1194,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "--corner-epsilon", type=float, default=CORNER_EPSILON
     )
+    parser.add_argument(
+        "--interior-initialization",
+        choices=("random", "coons"),
+        default=INTERIOR_INITIALIZATION,
+    )
     parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument(
+        "--seed", type=int, default=SEED,
+        help="Trainable-parameter initialization seed",
+    )
+    parser.add_argument(
+        "--sampling-seed", type=int, default=SEED,
+        help="Seed for the fixed interior collocation points",
+    )
+    parser.add_argument(
+        "--validation-seed", type=int, default=None,
+        help="Optional independent validation-set seed",
+    )
     tuned_group = parser.add_mutually_exclusive_group()
     tuned_group.add_argument("--use-tuned", dest="use_tuned", action="store_true")
     tuned_group.add_argument(
@@ -938,11 +1220,15 @@ if __name__ == "__main__":
     parser.set_defaults(use_tuned=None)
     arguments = parser.parse_args()
     main(
-        arguments.device,
-        arguments.n_basis,
-        arguments.degree,
-        arguments.knot_concentration,
-        arguments.corner_epsilon,
-        arguments.epochs,
-        arguments.use_tuned,
+        device_name=arguments.device,
+        n_basis=arguments.n_basis,
+        degree=arguments.degree,
+        knot_concentration=arguments.knot_concentration,
+        corner_epsilon=arguments.corner_epsilon,
+        interior_initialization=arguments.interior_initialization,
+        epochs=arguments.epochs,
+        use_tuned=arguments.use_tuned,
+        initialization_seed=arguments.seed,
+        sampling_seed=arguments.sampling_seed,
+        validation_seed=arguments.validation_seed,
     )

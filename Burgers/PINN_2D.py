@@ -6,6 +6,7 @@ import argparse
 import json
 import random
 import sys
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -57,6 +58,7 @@ N_INTERIOR_POINTS = int(CONFIG["sampling"]["interior_points"])
 N_BOUNDARY_POINTS_PER_EDGE = int(
     CONFIG["sampling"]["boundary_points_per_edge"]
 )
+N_INITIAL_POINTS = int(CONFIG["sampling"]["initial_points"])
 N_VALIDATION_POINTS = int(CONFIG["sampling"]["validation_points"])
 PLOT_SPATIAL_POINTS = int(CONFIG["sampling"]["plot_spatial_points"])
 PLOT_TIME_POINTS = int(CONFIG["sampling"]["plot_time_points"])
@@ -168,9 +170,9 @@ def sample_interior(
 
 
 def sample_constraints(
-    points_per_edge: int, device: torch.device
+    points_per_edge: int, initial_points: int, device: torch.device
 ) -> dict[str, torch.Tensor]:
-    x = torch.linspace(*X_BOUNDS, points_per_edge, device=device)
+    x = torch.linspace(*X_BOUNDS, initial_points, device=device)
     time = torch.linspace(*T_BOUNDS, points_per_edge, device=device)
     return {
         "initial": torch.stack((x, torch.full_like(x, T_BOUNDS[0])), dim=1),
@@ -349,6 +351,7 @@ def save_results(
     model: BurgersPINN,
     history: list[float],
     relative_error: float,
+    training_wall_time: float,
 ) -> None:
     device = next(model.parameters()).device
     x = np.linspace(*X_BOUNDS, PLOT_SPATIAL_POINTS)
@@ -381,6 +384,7 @@ def save_results(
         viscosity=np.asarray(VISCOSITY, dtype=float),
         n_layers=np.asarray(model.n_layers, dtype=int),
         n_neurons=np.asarray(model.n_neurons, dtype=int),
+        training_wall_time_seconds=np.asarray(training_wall_time, dtype=float),
     )
     figure, axes = plt.subplots(1, 3, figsize=(15, 4))
     for axis, values, title in zip(
@@ -403,7 +407,12 @@ def save_results(
 
     loss = np.asarray(history, dtype=float)
     epochs = np.arange(1, loss.size + 1)
-    np.savez_compressed(training_data, epoch=epochs, loss=loss)
+    np.savez_compressed(
+        training_data,
+        epoch=epochs,
+        loss=loss,
+        training_wall_time_seconds=np.asarray(training_wall_time, dtype=float),
+    )
     training_figure, axis = plt.subplots(figsize=(6, 4))
     axis.semilogy(epochs, loss)
     axis.set_xlabel("Epoch")
@@ -429,8 +438,13 @@ def main(
     constraint_mode: str = CONSTRAINT_MODE,
     epochs: int = EPOCHS,
     use_tuned: bool | None = None,
-) -> None:
-    set_seed(SEED)
+    initialization_seed: int = SEED,
+    sampling_seed: int = SEED,
+    validation_seed: int | None = None,
+    save_outputs: bool = True,
+    verbose: bool = True,
+) -> dict[str, float]:
+    set_seed(initialization_seed)
     device = select_device(device_name)
     should_load = (
         LOAD_TUNED_IF_AVAILABLE and RESULT_PATH.exists()
@@ -449,9 +463,11 @@ def main(
         f"constraints={constraint_mode}"
     )
     model = BurgersPINN(n_layers, n_neurons, constraint_mode).to(device)
-    generator = torch.Generator(device=device).manual_seed(SEED)
+    generator = torch.Generator(device=device).manual_seed(sampling_seed)
     interior = sample_interior(N_INTERIOR_POINTS, device, generator)
-    constraints = sample_constraints(N_BOUNDARY_POINTS_PER_EDGE, device)
+    constraints = sample_constraints(
+        N_BOUNDARY_POINTS_PER_EDGE, N_INITIAL_POINTS, device
+    )
     loss_fn = lambda: pinn_loss(model, interior, constraints)
     if OPTIMIZER_NAME.lower() != "adam":
         raise ValueError(f"Unsupported optimizer '{OPTIMIZER_NAME}'; expected 'Adam'")
@@ -463,6 +479,9 @@ def main(
         patience=SCHEDULER_PATIENCE,
         min_lr=MIN_LEARNING_RATE,
     )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    training_start = time.perf_counter()
     history = train(
         model.parameters(),
         loss_fn,
@@ -473,7 +492,18 @@ def main(
         min_delta=MIN_DELTA,
         print_every=PRINT_EVERY,
     )
-    validation = sample_interior(N_VALIDATION_POINTS, device, generator)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    training_wall_time = time.perf_counter() - training_start
+    print(f"Training wall time: {training_wall_time:.3f} s")
+    validation_generator = (
+        generator
+        if validation_seed is None
+        else torch.Generator(device=device).manual_seed(validation_seed)
+    )
+    validation = sample_interior(
+        N_VALIDATION_POINTS, device, validation_generator
+    )
     print("Computing validation reference solution")
     reference = numerical_reference_at_points(validation)
     relative_error = relative_l2_error(model, validation, reference)
@@ -483,7 +513,12 @@ def main(
     print(f"Validation PDE residual MSE: {residual_mse.item():.6e}")
     print(f"Maximum initial-condition error: {initial_error.item():.6e}")
     print(f"Maximum boundary error: {boundary_error.item():.6e}")
-    save_results(model, history, relative_error.item())
+    if save_outputs:
+        save_results(model, history, relative_error.item(), training_wall_time)
+    return {
+        "validation_relative_l2_error": relative_error.item(),
+        "training_time_seconds": training_wall_time,
+    }
 
 
 if __name__ == "__main__":

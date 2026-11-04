@@ -43,6 +43,7 @@ TUNING_EPOCHS = int(TUNING["epochs"])
 N_TRAIN_POINTS = int(TUNING["training_points"])
 N_VALIDATION_POINTS = int(TUNING["validation_points"])
 N_BOUNDARY_POINTS = int(TUNING["boundary_points_per_edge"])
+N_INITIAL_POINTS = int(TUNING["initial_points"])
 SCHEDULER_FACTOR = float(TUNING["scheduler"]["factor"])
 SCHEDULER_PATIENCE = int(TUNING["scheduler"]["patience"])
 MIN_LEARNING_RATE = float(TUNING["scheduler"]["min_learning_rate"])
@@ -139,7 +140,9 @@ def main(
     generator = torch.Generator(device=device).manual_seed(SEED)
     training = sample_interior(N_TRAIN_POINTS, device, generator)
     validation = sample_interior(N_VALIDATION_POINTS, device, generator)
-    constraints = sample_constraints(N_BOUNDARY_POINTS, device)
+    constraints = sample_constraints(
+        N_BOUNDARY_POINTS, N_INITIAL_POINTS, device
+    )
     print("Computing the validation reference solution once")
     reference = numerical_reference_at_points(validation)
     study = run_tpe_study(

@@ -16,8 +16,9 @@ from hyperparameter_optimization import run_tpe_study
 from KleinGordon.Bspline_3D import (
     CONFIG, CONSTRAINT_MODE, DEFAULT_DEVICE, LOSS_WEIGHTS, RESULT_PATH, SEED,
     KleinGordonBSpline, bspline_loss, precompute_operators,
+    pretrain_condition_coefficients,
 )
-from KleinGordon._common import relative_l2_error, sample_constraints, sample_interior, select_device, set_seed
+from KleinGordon.Bspline_3D import relative_l2_error, sample_constraints, sample_interior, select_device, set_seed
 from training import train
 
 TUNING = CONFIG["tuning"]
@@ -46,12 +47,30 @@ def main(device_name=DEFAULT_DEVICE, constraint_mode=CONSTRAINT_MODE, n_trials=N
             name: precompute_operators(model, points)
             for name, points in constraints.items()
         }
-        optimizer = torch.optim.Adam(model.parameters(), lr=float(CONFIG["training"]["learning_rate"]))
         scheduler_cfg = TUNING["scheduler"]
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=float(scheduler_cfg["factor"]), patience=int(scheduler_cfg["patience"]), min_lr=float(scheduler_cfg["min_learning_rate"]))
         stopping = TUNING["early_stopping"]
+        if constraint_mode == "hard":
+            pretrain_condition_coefficients(
+                model,
+                constraint_operators,
+                constraints,
+                epochs=epochs,
+                learning_rate=float(CONFIG["training"]["learning_rate"]),
+                scheduler_config=scheduler_cfg,
+                stopping_config=stopping,
+                print_every=0,
+            )
+        pde_parameters = (
+            [model.interior_coefficients]
+            if constraint_mode == "hard"
+            else list(model.parameters())
+        )
+        optimizer = torch.optim.Adam(
+            pde_parameters, lr=float(CONFIG["training"]["learning_rate"])
+        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=float(scheduler_cfg["factor"]), patience=int(scheduler_cfg["patience"]), min_lr=float(scheduler_cfg["min_learning_rate"]))
         train(
-            model.parameters(),
+            pde_parameters,
             lambda: bspline_loss(
                 model, training_operators, training_points,
                 constraint_operators, constraints, LOSS_WEIGHTS,

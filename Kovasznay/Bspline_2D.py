@@ -1,6 +1,8 @@
 import argparse
 import json
+import random
 import sys
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -42,8 +44,10 @@ DEFAULT_DEVICE = str(CONFIG["runtime"]["device"])
 LOAD_TUNED_IF_AVAILABLE = bool(CONFIG["runtime"]["load_tuned_if_available"])
 N_BASIS = int(CONFIG["model"]["n_basis"])
 DEGREE = int(CONFIG["model"]["degree"])
+INTERIOR_INITIALIZATION = str(CONFIG["model"].get("interior_initialization", "random"))
 N_INTERIOR_POINTS = int(CONFIG["sampling"]["interior_points"])
 N_BOUNDARY_POINTS = int(CONFIG["sampling"]["boundary_points_per_edge"])
+N_VALIDATION_POINTS = int(CONFIG["sampling"]["validation_points"])
 PLOT_X_POINTS = int(CONFIG["sampling"]["plot_x_points"])
 PLOT_Y_POINTS = int(CONFIG["sampling"]["plot_y_points"])
 BOUNDARY_EPOCHS = int(CONFIG["boundary_preprocessing"]["epochs"])
@@ -77,6 +81,15 @@ INTERIOR_STOPPING_PATIENCE = int(
 INTERIOR_MIN_DELTA = float(CONFIG["training"]["early_stopping"]["min_delta"])
 INTERIOR_PRINT_EVERY = int(CONFIG["training"]["print_every"])
 HYPERPARAMETER_PATH = SCRIPT_DIR / CONFIG["output"]["tuned_hyperparameters"]
+POSTPROCESSING_DIR = SCRIPT_DIR / CONFIG["output"]["postprocessing_directory"]
+SHOW_PLOTS = bool(CONFIG["output"]["show_plots"])
+
+
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 class bsplines:
@@ -102,7 +115,7 @@ class bsplines:
         coefficients[:, 1:-1, 1:-1] = self.interior_coeffs
         return coefficients
 
-    def set_boundary_coefficients(self, boundary_coefficients):
+    def set_boundary_coefficients(self, boundary_coefficients, initialization="coons"):
         """Freeze the four fitted edges and initialize a new interior block."""
         if boundary_coefficients.shape != self.coeffs.shape:
             raise ValueError(
@@ -110,7 +123,16 @@ class bsplines:
                 f"got {tuple(boundary_coefficients.shape)}"
             )
         self.boundary_coeffs = boundary_coefficients.detach().clone()
-        initial_coefficients = self._coons_initialization(self.boundary_coeffs)
+        if initialization == "coons":
+            initial_coefficients = self._coons_initialization(self.boundary_coeffs)
+        elif initialization == "random":
+            initial_coefficients = 0.01 * torch.randn_like(self.boundary_coeffs)
+            initial_coefficients[:, 0, :] = self.boundary_coeffs[:, 0, :]
+            initial_coefficients[:, -1, :] = self.boundary_coeffs[:, -1, :]
+            initial_coefficients[:, :, 0] = self.boundary_coeffs[:, :, 0]
+            initial_coefficients[:, :, -1] = self.boundary_coeffs[:, :, -1]
+        else:
+            raise ValueError("interior_initialization must be 'random' or 'coons'")
         self.interior_coeffs = (
             initial_coefficients[:, 1:-1, 1:-1]
             .detach()
@@ -396,6 +418,16 @@ def load_best_hyperparameters(path=HYPERPARAMETER_PATH):
     return int(result["best_params"]["n_basis"]), int(result["best_params"]["degree"])
 
 
+def tuned_result_available(path=HYPERPARAMETER_PATH):
+    try:
+        result = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    return bool(result.get("best_params")) and result.get("status") not in {
+        "not_tuned", "legacy_parameters_not_retuned_with_l2_objective"
+    }
+
+
 def select_device(name):
     if name == "gpu":
         if not torch.cuda.is_available():
@@ -411,12 +443,17 @@ def main(
     n_basis=N_BASIS,
     degree=DEGREE,
     use_tuned=None,
+    interior_initialization=INTERIOR_INITIALIZATION,
+    initialization_seed=SEED,
+    sampling_seed=SEED,
+    validation_seed=None,
+    save_outputs=True,
+    verbose=True,
 ):
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
+    set_seed(initialization_seed)
     device = select_device(device_name)
     should_load = (
-        LOAD_TUNED_IF_AVAILABLE and HYPERPARAMETER_PATH.exists()
+        LOAD_TUNED_IF_AVAILABLE and tuned_result_available()
         if use_tuned is None else use_tuned
     )
     if should_load:
@@ -424,10 +461,14 @@ def main(
         print(f"Loaded tuned hyperparameters from: {HYPERPARAMETER_PATH}")
     print(f"Using device: {device}")
     print(f"Loaded configuration from: {CONFIG_PATH}")
-    print(f"Using tuned B-splines: n_basis={n_basis}, degree={degree}")
-    interior = sample_interior(N_INTERIOR_POINTS, device)
+    print(f"Kovasznay B-spline: n_basis={n_basis}, degree={degree}, initialization={interior_initialization}")
+    generator = torch.Generator(device=device).manual_seed(sampling_seed)
+    interior = sample_interior(N_INTERIOR_POINTS, device, generator)
     boundary = sample_boundary(N_BOUNDARY_POINTS, device)
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    start = time.perf_counter()
     print("Stage 1/2: preprocessing boundary conditions")
     boundary_coefficients, boundary_history = pretrain_boundary_coefficients(
         n_basis,
@@ -440,7 +481,7 @@ def main(
     # Create a separate PDE model. The boundary edges are copied and detached;
     # its interior is initialized from those edges, then optimized independently.
     model = bsplines(n_basis, degree, device)
-    model.set_boundary_coefficients(boundary_coefficients)
+    model.set_boundary_coefficients(boundary_coefficients, interior_initialization)
     operators = precompute_operators(model, interior)
     initial_boundary_loss = boundary_loss(model, boundary).item()
     print(f"Frozen boundary loss: {initial_boundary_loss:.6e}")
@@ -466,8 +507,30 @@ def main(
         min_delta=INTERIOR_MIN_DELTA,
         print_every=INTERIOR_PRINT_EVERY,
     )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    wall_time = time.perf_counter() - start
     final_boundary_loss = boundary_loss(model, boundary).item()
     print(f"Boundary loss after PDE training: {final_boundary_loss:.6e}")
+
+    validation_generator = generator if validation_seed is None else torch.Generator(device=device).manual_seed(validation_seed)
+    validation = sample_interior(N_VALIDATION_POINTS, device, validation_generator)
+    with torch.no_grad():
+        validation_prediction = model.forward(validation)
+        validation_reference = exact_solution(validation)
+        validation_errors = (
+            torch.linalg.vector_norm(validation_prediction - validation_reference, dim=0)
+            / torch.linalg.vector_norm(validation_reference, dim=0)
+        )
+    for name, error in zip(("u", "v", "p"), validation_errors):
+        print(f"Relative validation L2 error {name}: {error.item():.6e}")
+    print(f"Total training wall time: {wall_time:.3f} s")
+    result = {
+        "validation_relative_l2_error": float(validation_errors.mean()),
+        "training_time_seconds": wall_time,
+    }
+    if not save_outputs:
+        return result
 
     x = np.linspace(*X_BOUNDS, PLOT_X_POINTS)
     y = np.linspace(*Y_BOUNDS, PLOT_Y_POINTS)
@@ -489,19 +552,40 @@ def main(
             image = axes[row, col].imshow(value, extent=[*X_BOUNDS, *Y_BOUNDS], origin="lower", aspect="auto")
             axes[row, col].set_title(title)
             fig.colorbar(image, ax=axes[row, col])
-        relative_error = np.linalg.norm(values[0] - values[1]) / np.linalg.norm(values[1])
-        print(f"Relative L2 error {name}: {relative_error:.6e}")
     plt.tight_layout()
-    plt.show()
 
-    plt.plot(boundary_history, label="Boundary preprocessing")
-    plt.plot(history, label="Interior PDE training")
-    plt.yscale("log")
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss")
-    plt.title("Kovasznay B-spline Loss")
-    plt.legend()
-    plt.show()
+    POSTPROCESSING_DIR.mkdir(parents=True, exist_ok=True)
+    stem = "bspline_kovasznay_hard"
+    solution_path = POSTPROCESSING_DIR / f"{stem}_solution_data.npz"
+    training_path = POSTPROCESSING_DIR / f"{stem}_training_data.npz"
+    np.savez_compressed(
+        solution_path, x=x, y=y, prediction=prediction, reference=exact,
+        absolute_error=np.abs(prediction-exact),
+        validation_relative_l2_errors=validation_errors.cpu().numpy(),
+        validation_relative_l2_error=float(validation_errors.mean()),
+        validation_points=validation.cpu().numpy(),
+        validation_prediction=validation_prediction.cpu().numpy(),
+        validation_reference=validation_reference.cpu().numpy(),
+        training_wall_time_seconds=wall_time,
+        field_names=np.asarray(("u", "v", "p")), n_basis=n_basis,
+        degree=degree, interior_initialization=np.asarray(interior_initialization),
+        reynolds_number=REYNOLDS_NUMBER,
+    )
+    boundary_values, interior_values = np.asarray(boundary_history), np.asarray(history)
+    np.savez_compressed(
+        training_path,
+        boundary_epoch=np.arange(1, boundary_values.size+1), boundary_loss=boundary_values,
+        interior_epoch=np.arange(1, interior_values.size+1), interior_loss=interior_values,
+        epoch=np.arange(1, interior_values.size+1), loss=interior_values,
+        training_wall_time_seconds=wall_time,
+    )
+    print(f"Saved solution data to: {solution_path}")
+    print(f"Saved training data to: {training_path}")
+    if SHOW_PLOTS:
+        plt.show()
+    else:
+        plt.close("all")
+    return result
 
 
 if __name__ == "__main__":
@@ -511,6 +595,7 @@ if __name__ == "__main__":
     parser.add_argument("--interior-epochs", type=int, default=INTERIOR_EPOCHS)
     parser.add_argument("--n-basis", type=int, default=N_BASIS)
     parser.add_argument("--degree", type=int, default=DEGREE)
+    parser.add_argument("--initialization", choices=("random", "coons"), default=INTERIOR_INITIALIZATION)
     tuned = parser.add_mutually_exclusive_group()
     tuned.add_argument("--use-tuned", dest="use_tuned", action="store_true")
     tuned.add_argument("--no-use-tuned", dest="use_tuned", action="store_false")
@@ -518,5 +603,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(
         args.device, args.boundary_epochs, args.interior_epochs,
-        args.n_basis, args.degree, args.use_tuned,
+        args.n_basis, args.degree, args.use_tuned, args.initialization,
     )

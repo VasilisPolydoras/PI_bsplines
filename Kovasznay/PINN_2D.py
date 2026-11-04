@@ -6,6 +6,7 @@ import argparse
 import json
 import random
 import sys
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -273,8 +274,18 @@ def load_hyperparameters(
     return int(params["n_layers"]), int(params["n_neurons"])
 
 
+def tuned_result_available(constraint_mode: str, path: Path = RESULT_PATH) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    entry = payload.get(constraint_mode, payload)
+    return bool(entry.get("best_params")) and entry.get("status") != "not_tuned"
+
+
 def save_results(
-    model: KovasznayPINN, history: list[float], errors: np.ndarray
+    model: KovasznayPINN, history: list[float], errors: np.ndarray,
+    validation: torch.Tensor, wall_time: float,
 ) -> None:
     device = next(model.parameters()).device
     x = np.linspace(*X_BOUNDS, PLOT_X_POINTS)
@@ -302,6 +313,11 @@ def save_results(
         constraint_mode=np.asarray(model.constraint_mode),
         reynolds_number=np.asarray(REYNOLDS_NUMBER),
         n_layers=np.asarray(model.n_layers), n_neurons=np.asarray(model.n_neurons),
+        validation_relative_l2_error=np.asarray(errors.mean()),
+        validation_points=validation.detach().cpu().numpy(),
+        validation_prediction=model(validation).detach().cpu().numpy(),
+        validation_reference=exact_solution(validation).detach().cpu().numpy(),
+        training_wall_time_seconds=np.asarray(wall_time),
     )
     figure, axes = plt.subplots(3, 3, figsize=(14, 12))
     for row, name in enumerate(("u", "v", "p")):
@@ -320,7 +336,10 @@ def save_results(
     figure.savefig(solution_plot, dpi=300, bbox_inches="tight")
     loss = np.asarray(history)
     epochs = np.arange(1, loss.size + 1)
-    np.savez_compressed(training_data, epoch=epochs, loss=loss)
+    np.savez_compressed(
+        training_data, epoch=epochs, loss=loss,
+        training_wall_time_seconds=np.asarray(wall_time),
+    )
     training_figure, axis = plt.subplots(figsize=(6, 4))
     axis.semilogy(epochs, loss)
     axis.set_xlabel("Epoch")
@@ -346,11 +365,16 @@ def main(
     constraint_mode: str = CONSTRAINT_MODE,
     epochs: int = EPOCHS,
     use_tuned: bool | None = None,
-) -> None:
-    set_seed()
+    initialization_seed: int = SEED,
+    sampling_seed: int = SEED,
+    validation_seed: int | None = None,
+    save_outputs: bool = True,
+    verbose: bool = True,
+) -> dict[str, float]:
+    set_seed(initialization_seed)
     device = select_device(device_name)
     should_load = (
-        LOAD_TUNED_IF_AVAILABLE and RESULT_PATH.exists()
+        LOAD_TUNED_IF_AVAILABLE and tuned_result_available(constraint_mode)
         if use_tuned is None else use_tuned
     )
     if should_load:
@@ -364,7 +388,7 @@ def main(
         f"constraints={constraint_mode}"
     )
     model = KovasznayPINN(n_layers, n_neurons, constraint_mode).to(device)
-    generator = torch.Generator(device=device).manual_seed(SEED)
+    generator = torch.Generator(device=device).manual_seed(sampling_seed)
     interior = sample_interior(N_INTERIOR_POINTS, device, generator)
     boundary = sample_boundary(N_BOUNDARY_POINTS, device)
     loss_fn = lambda: physics_loss(model, interior, boundary)
@@ -375,12 +399,19 @@ def main(
         optimizer, mode="min", factor=SCHEDULER_FACTOR,
         patience=SCHEDULER_PATIENCE, min_lr=MIN_LEARNING_RATE,
     )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    start = time.perf_counter()
     history = train(
         model.parameters(), loss_fn, optimizer, epochs=epochs,
         scheduler=scheduler, early_stopping_patience=EARLY_STOPPING_PATIENCE,
         min_delta=MIN_DELTA, print_every=PRINT_EVERY,
     )
-    validation = sample_interior(N_VALIDATION_POINTS, device, generator)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    wall_time = time.perf_counter() - start
+    validation_generator = generator if validation_seed is None else torch.Generator(device=device).manual_seed(validation_seed)
+    validation = sample_interior(N_VALIDATION_POINTS, device, validation_generator)
     errors = field_relative_l2_errors(model, validation)
     residual_mse = kovasznay_residual(model, validation).square().mean(dim=0)
     boundary_max = (model(boundary) - exact_solution(boundary)).abs().max()
@@ -391,7 +422,14 @@ def main(
         f"{residual_mse.detach().cpu().numpy()}"
     )
     print(f"Maximum boundary error: {boundary_max.item():.6e}")
-    save_results(model, history, errors.detach().cpu().numpy())
+    print(f"Training wall time: {wall_time:.3f} s")
+    result = {
+        "validation_relative_l2_error": float(errors.mean()),
+        "training_time_seconds": wall_time,
+    }
+    if save_outputs:
+        save_results(model, history, errors.detach().cpu().numpy(), validation, wall_time)
+    return result
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import json
 import math
 import random
 import sys
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -36,11 +37,20 @@ FLEXURAL_RIGIDITY = (
 
 SEED = int(CONFIG["reproducibility"]["seed"])
 DEFAULT_DEVICE = str(CONFIG["runtime"]["device"])
+LOAD_TUNED_IF_AVAILABLE = bool(CONFIG["runtime"]["load_tuned_if_available"])
+N_BASIS = int(CONFIG["model"]["n_basis"])
+DEGREE = int(CONFIG["model"]["degree"])
 N_INTERIOR_POINTS = int(CONFIG["sampling"]["interior_points"])
 N_BOUNDARY_POINTS_PER_EDGE = int(CONFIG["sampling"]["boundary_points_per_edge"])
+N_VALIDATION_POINTS = int(CONFIG["sampling"]["validation_points"])
 EPOCHS = int(CONFIG["training"]["epochs"])
 LEARNING_RATE = float(CONFIG["training"]["learning_rate"])
-LBFGS_MAX_ITERATIONS = int(CONFIG["training"]["lbfgs_max_iterations"])
+SCHEDULER_FACTOR = float(CONFIG["training"]["scheduler"]["factor"])
+SCHEDULER_PATIENCE = int(CONFIG["training"]["scheduler"]["patience"])
+MIN_LEARNING_RATE = float(CONFIG["training"]["scheduler"]["min_learning_rate"])
+EARLY_STOPPING_PATIENCE = int(CONFIG["training"]["early_stopping"]["patience"])
+MIN_DELTA = float(CONFIG["training"]["early_stopping"]["min_delta"])
+PRINT_EVERY = int(CONFIG["training"]["print_every"])
 PDE_WEIGHT = 1.0
 MOMENT_BC_WEIGHT = 1.0
 RESULT_PATH = SCRIPT_DIR / CONFIG["output"]["tuned_hyperparameters"]
@@ -176,7 +186,7 @@ def basis_derivative_matrix(
     return result
 
 
-class bsplines(torch.nn.Module):
+class KirchhoffBSpline(torch.nn.Module):
     """Tensor-product deflection satisfying simply supported BCs exactly."""
 
     def __init__(
@@ -282,22 +292,10 @@ def sample_interior(
     device: torch.device,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    # Reflection-complete samples prevent Monte Carlo imbalance from shifting
-    # the solution away from the center of this symmetric problem.
-    base_count = (count + 3) // 4
-    base = torch.rand(base_count, 2, device=device, generator=generator)
-    base[:, 0] *= PLATE_LENGTH_X
-    base[:, 1] *= PLATE_LENGTH_Y
-    reflected_x = base.clone()
-    reflected_x[:, 0] = PLATE_LENGTH_X - reflected_x[:, 0]
-    reflected_y = base.clone()
-    reflected_y[:, 1] = PLATE_LENGTH_Y - reflected_y[:, 1]
-    reflected_xy = torch.empty_like(base)
-    reflected_xy[:, 0] = PLATE_LENGTH_X - base[:, 0]
-    reflected_xy[:, 1] = PLATE_LENGTH_Y - base[:, 1]
-    return torch.cat(
-        (base, reflected_x, reflected_y, reflected_xy), dim=0
-    )[:count]
+    points = torch.rand(count, 2, device=device, generator=generator)
+    points[:, 0] *= PLATE_LENGTH_X
+    points[:, 1] *= PLATE_LENGTH_Y
+    return points
 
 
 def sample_boundary(
@@ -351,11 +349,11 @@ def exact_solution(points: torch.Tensor) -> torch.Tensor:
     )
 
 
-def precompute_operators(model: bsplines, points: torch.Tensor, max_order=4):
+def precompute_operators(model: KirchhoffBSpline, points: torch.Tensor, max_order=4):
     return model.operators(points, max_order=max_order)
 
 
-def pde_loss(model: bsplines, operators, points: torch.Tensor) -> torch.Tensor:
+def pde_loss(model: KirchhoffBSpline, operators, points: torch.Tensor) -> torch.Tensor:
     biharmonic = (
         model.evaluate(operators, dx=4, dy=0)
         + 2.0 * model.evaluate(operators, dx=2, dy=2)
@@ -368,7 +366,7 @@ def pde_loss(model: bsplines, operators, points: torch.Tensor) -> torch.Tensor:
 
 
 def moment_boundary_loss(
-    model: bsplines, vertical_operators, horizontal_operators
+    model: KirchhoffBSpline, vertical_operators, horizontal_operators
 ) -> torch.Tensor:
     """Enforce M_x=0 vertically and M_y=0 horizontally."""
     vertical_curvature = (
@@ -395,7 +393,7 @@ def moment_boundary_loss(
 
 
 def total_loss(
-    model: bsplines,
+    model: KirchhoffBSpline,
     interior_operators,
     interior_points: torch.Tensor,
     vertical_operators,
@@ -405,52 +403,26 @@ def total_loss(
     return PDE_WEIGHT * pde_loss(model, interior_operators, interior_points)
 
 
-def refine_with_lbfgs(
-    model: bsplines,
-    loss_fn,
-    max_iterations: int = LBFGS_MAX_ITERATIONS,
-) -> float:
-    """Refine the linear spline coefficients after the Adam stage."""
-    optimizer = torch.optim.LBFGS(
-        model.parameters(),
-        lr=1.0,
-        max_iter=max_iterations,
-        tolerance_grad=1.0e-10,
-        tolerance_change=1.0e-12,
-        line_search_fn="strong_wolfe",
-    )
-
-    def closure():
-        optimizer.zero_grad()
-        loss = loss_fn()
-        loss.backward()
-        return loss
-
-    optimizer.step(closure)
-    return loss_fn().detach().item()
-
-
-def load_hyperparameters(path: Path = RESULT_PATH) -> tuple[int, int, int]:
+def load_hyperparameters(path: Path = RESULT_PATH) -> tuple[int, int]:
     if not path.exists():
         raise FileNotFoundError(
             f"No tuned hyperparameters found at {path}. Run tune_bsplines.py first."
         )
     payload = json.loads(path.read_text(encoding="utf-8"))
     params = payload.get("best_params", payload)
-    return (
-        int(params["n_basis_x"]),
-        int(params["n_basis_y"]),
-        int(params["degree"]),
-    )
+    basis = params.get("n_basis", params.get("n_basis_x"))
+    return int(basis), int(params["degree"])
 
 
 def plot_comparison(
-    model: bsplines, device: torch.device, history: list[float], resolution=None
+    model: KirchhoffBSpline, device: torch.device, history: list[float],
+    validation: torch.Tensor, validation_error: float, wall_time: float,
+    resolution=None,
 ) -> None:
     resolution = resolution or int(CONFIG["sampling"]["plot_points_per_axis"])
     x_axis = torch.linspace(0.0, PLATE_LENGTH_X, resolution, device=device)
     y_axis = torch.linspace(0.0, PLATE_LENGTH_Y, resolution, device=device)
-    x_grid, y_grid = torch.meshgrid(x_axis, y_axis, indexing="ij")
+    x_grid, y_grid = torch.meshgrid(x_axis, y_axis, indexing="xy")
     points = torch.stack((x_grid.reshape(-1), y_grid.reshape(-1)), dim=1)
     operators = precompute_operators(model, points)
     with torch.no_grad():
@@ -465,11 +437,13 @@ def plot_comparison(
             )
             - transverse_load(points)
         ) / LOAD_AMPLITUDE
-    relative_error = (
+    grid_error = (
         torch.linalg.vector_norm(prediction - exact)
         / torch.linalg.vector_norm(exact)
     ).item()
-    print(f"Relative L2 deflection error: {relative_error:.6e}")
+    with torch.no_grad():
+        validation_prediction = model(validation).squeeze(-1)
+        validation_reference = exact_solution(validation)
 
     x_np, y_np = x_grid.cpu().numpy(), y_grid.cpu().numpy()
     fields = (
@@ -496,10 +470,18 @@ def plot_comparison(
         reference=exact.reshape(resolution, resolution).cpu().numpy(),
         absolute_error=torch.abs(prediction-exact).reshape(resolution, resolution).cpu().numpy(),
         residual=torch.abs(residual).reshape(resolution, resolution).cpu().numpy(),
-        validation_relative_l2_error=np.asarray(relative_error),
+        validation_relative_l2_error=np.asarray(validation_error),
+        plot_grid_relative_l2_error=np.asarray(grid_error),
+        validation_points=validation.cpu().numpy(),
+        validation_prediction=validation_prediction.cpu().numpy(),
+        validation_reference=validation_reference.cpu().numpy(),
+        training_wall_time_seconds=np.asarray(wall_time),
+        n_basis=np.asarray(model.n_basis_x), degree=np.asarray(model.degree),
+        boundary_constraint=np.asarray("exact_simply_supported"),
     )
     np.savez_compressed(
-        training_path, epoch=np.arange(1, len(history)+1), loss=np.asarray(history)
+        training_path, epoch=np.arange(1, len(history)+1), loss=np.asarray(history),
+        training_wall_time_seconds=np.asarray(wall_time),
     )
     figure.savefig(
         POSTPROCESSING_DIR / "bspline_kirchhoff_hard_solution.png",
@@ -523,40 +505,48 @@ def plot_comparison(
 
 def main(
     device_name: str = DEFAULT_DEVICE,
+    n_basis: int = N_BASIS,
+    degree: int = DEGREE,
     epochs: int | None = None,
     use_tuned: bool | None = None,
-) -> None:
-    set_seed()
+    initialization_seed: int = SEED,
+    sampling_seed: int = SEED,
+    validation_seed: int | None = None,
+    save_outputs: bool = True,
+    verbose: bool = True,
+) -> dict[str, float]:
+    set_seed(initialization_seed)
     device = select_device(device_name)
     should_load = (
-        bool(CONFIG["runtime"]["load_tuned_if_available"]) and RESULT_PATH.exists()
+        LOAD_TUNED_IF_AVAILABLE and RESULT_PATH.exists()
         if use_tuned is None else use_tuned
     )
     if should_load:
-        n_basis_x, n_basis_y, degree = load_hyperparameters()
-    else:
-        n_basis_x = int(CONFIG["model"]["n_basis_x"])
-        n_basis_y = int(CONFIG["model"]["n_basis_y"])
-        degree = int(CONFIG["model"]["degree"])
-    print(f"Using device: {device}")
-    print(
-        f"B-splines: n_basis_x={n_basis_x}, n_basis_y={n_basis_y}, "
-        f"degree={degree}"
-    )
-    generator = torch.Generator(device=device).manual_seed(SEED)
+        n_basis, degree = load_hyperparameters()
+        if verbose:
+            print(f"Loaded tuned hyperparameters from: {RESULT_PATH}")
+    n_basis = int(n_basis)
+    degree = int(degree)
+    generator = torch.Generator(device=device).manual_seed(sampling_seed)
     interior_points = sample_interior(N_INTERIOR_POINTS, device, generator)
     vertical_points, horizontal_points = sample_boundary(
         N_BOUNDARY_POINTS_PER_EDGE, device
     )
-    model = bsplines(n_basis_x, n_basis_y, degree, device)
+    model = KirchhoffBSpline(n_basis, n_basis, degree, device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    start = time.perf_counter()
     interior_operators = precompute_operators(model, interior_points)
     vertical_operators = precompute_operators(model, vertical_points, max_order=2)
     horizontal_operators = precompute_operators(
         model, horizontal_points, max_order=2
     )
+    if str(CONFIG["training"]["optimizer"]).lower() != "adam":
+        raise ValueError("Only Adam is supported")
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.8, patience=50, min_lr=1.0e-5
+        optimizer, mode="min", factor=SCHEDULER_FACTOR,
+        patience=SCHEDULER_PATIENCE, min_lr=MIN_LEARNING_RATE,
     )
     loss_fn = lambda: total_loss(
         model,
@@ -571,12 +561,27 @@ def main(
         optimizer,
         epochs=epochs or EPOCHS,
         scheduler=scheduler,
-        early_stopping_patience=500,
-        min_delta=1.0e-9,
-        print_every=100,
+        early_stopping_patience=EARLY_STOPPING_PATIENCE,
+        min_delta=MIN_DELTA,
+        print_every=PRINT_EVERY if verbose else 0,
     )
-    refined_loss = refine_with_lbfgs(model, loss_fn)
-    print(f"Loss after L-BFGS refinement: {refined_loss:.6e}")
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    wall_time = time.perf_counter() - start
+    validation_generator = (
+        generator if validation_seed is None
+        else torch.Generator(device=device).manual_seed(validation_seed)
+    )
+    validation = sample_interior(
+        N_VALIDATION_POINTS, device, validation_generator
+    )
+    with torch.no_grad():
+        validation_prediction = model(validation).squeeze(-1)
+        validation_reference = exact_solution(validation)
+        validation_error = float(
+            torch.linalg.vector_norm(validation_prediction-validation_reference)
+            / torch.linalg.vector_norm(validation_reference)
+        )
     with torch.no_grad():
         interior_error = pde_loss(model, interior_operators, interior_points)
         moment_error = moment_boundary_loss(
@@ -584,13 +589,22 @@ def main(
         )
         boundary_points = torch.cat((vertical_points, horizontal_points), dim=0)
         maximum_boundary_deflection = model(boundary_points).abs().max()
-    print(f"Normalized PDE MSE: {interior_error.item():.6e}")
-    print(f"Normalized moment BC MSE: {moment_error.item():.6e}")
-    print(
-        "Maximum boundary |w| (hard condition): "
-        f"{maximum_boundary_deflection.item():.6e}"
-    )
-    plot_comparison(model, device, history)
+    if verbose:
+        print(f"Using device: {device}")
+        print(f"B-splines: n_basis={n_basis}, degree={degree}")
+        print(f"Training wall time: {wall_time:.3f} s")
+        print(f"Validation relative L2 error: {validation_error:.6e}")
+        print(f"Normalized PDE MSE: {interior_error.item():.6e}")
+        print(f"Normalized moment BC MSE: {moment_error.item():.6e}")
+        print(f"Maximum boundary |w|: {maximum_boundary_deflection.item():.6e}")
+    if save_outputs:
+        plot_comparison(
+            model, device, history, validation, validation_error, wall_time
+        )
+    return {
+        "validation_relative_l2_error": validation_error,
+        "training_time_seconds": wall_time,
+    }
 
 
 if __name__ == "__main__":
@@ -598,10 +612,16 @@ if __name__ == "__main__":
         description="Solve a rectangular Kirchhoff plate using B-splines"
     )
     parser.add_argument("--device", choices=("cpu", "gpu"), default=DEFAULT_DEVICE)
-    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--n-basis", type=int, default=N_BASIS)
+    parser.add_argument("--degree", type=int, default=DEGREE)
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
     tuned = parser.add_mutually_exclusive_group()
     tuned.add_argument("--use-tuned", dest="use_tuned", action="store_true")
     tuned.add_argument("--no-use-tuned", dest="use_tuned", action="store_false")
     parser.set_defaults(use_tuned=None)
     arguments = parser.parse_args()
-    main(arguments.device, arguments.epochs, arguments.use_tuned)
+    main(
+        device_name=arguments.device, n_basis=arguments.n_basis,
+        degree=arguments.degree, epochs=arguments.epochs,
+        use_tuned=arguments.use_tuned,
+    )

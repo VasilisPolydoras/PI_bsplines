@@ -1,29 +1,131 @@
 """Tensor-product B-spline solver for the (2+1)-D Klein--Gordon PDE.
 
-Hard Dirichlet/initial values are interpolated at tensor-product Greville
-abscissae and frozen. PDE derivatives are evaluated analytically from
-B-spline derivative matrices; input-coordinate autograd is not used.
+In hard mode, the inhomogeneous Dirichlet, initial-value, and initial-velocity
+coefficient surfaces are pretrained sequentially and frozen before PDE
+training. PDE derivatives are evaluated analytically from B-spline matrices.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
+import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from KleinGordon._common import (
-    T_BOUNDS, X_BOUNDS, Y_BOUNDS, exact_solution, forcing,
-    initial_value_xy, initial_velocity_xy, relative_l2_error,
-    sample_constraints, sample_interior, save_results, select_device, set_seed,
-)
 from training import train
+
+X_BOUNDS, Y_BOUNDS, T_BOUNDS = (-1.0, 1.0), (-1.0, 1.0), (0.0, 10.0)
+
+
+def set_seed(seed):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+
+def select_device(name):
+    if name == "cpu": return torch.device("cpu")
+    if name == "gpu" and torch.cuda.is_available(): return torch.device("cuda")
+    if name == "gpu": raise RuntimeError("GPU requested, but CUDA is not available")
+    raise ValueError("device must be 'cpu' or 'gpu'")
+
+
+def exact_solution(points):
+    x, y, time = points.unbind(1)
+    return (x + y) * torch.cos(2.0 * time) + x * y * torch.sin(2.0 * time)
+
+
+def initial_value_xy(x, y): return x + y
+def initial_velocity_xy(x, y): return 2.0 * x * y
+
+
+def forcing(points):
+    value = exact_solution(points)
+    return value.square() - 4.0 * value
+
+
+def sample_interior(count, device, generator=None):
+    points = torch.rand(count, 3, device=device, generator=generator)
+    points[:, 0] = -1.0 + 2.0 * points[:, 0]
+    points[:, 1] = -1.0 + 2.0 * points[:, 1]
+    points[:, 2] = 10.0 * points[:, 2]
+    return points
+
+
+def sample_constraints(face_count, initial_count, device, generator=None):
+    initial_xy = -1.0 + 2.0 * torch.rand(initial_count, 2, device=device, generator=generator)
+    initial = torch.column_stack((initial_xy, torch.zeros(initial_count, device=device)))
+    faces = []
+    for axis, value in ((0, -1.0), (0, 1.0), (1, -1.0), (1, 1.0)):
+        face = sample_interior(face_count, device, generator); face[:, axis] = value; faces.append(face)
+    return {"initial": initial, "boundary": torch.cat(faces)}
+
+
+def relative_l2_error(model, points):
+    with torch.no_grad():
+        reference, prediction = exact_solution(points), model(points)
+    return torch.linalg.vector_norm(prediction - reference) / torch.linalg.vector_norm(reference)
+
+
+def save_results(model, history, relative_error, validation, wall_time, output, stem,
+                 title, spatial_points, plot_times, metadata, show_plots,
+                 condition_history=None):
+    device = next(model.parameters()).device
+    x = np.linspace(*X_BOUNDS, spatial_points); y = np.linspace(*Y_BOUNDS, spatial_points)
+    times = np.asarray(plot_times); gx, gy = np.meshgrid(x, y, indexing="xy")
+    prediction, reference = [], []
+    with torch.no_grad():
+        for value in times:
+            points = torch.tensor(np.column_stack((gx.ravel(), gy.ravel(), np.full(gx.size, value))), dtype=torch.float32, device=device)
+            prediction.append(model(points).cpu().numpy().reshape(gx.shape))
+            reference.append(exact_solution(points).cpu().numpy().reshape(gx.shape))
+    prediction, reference = np.stack(prediction), np.stack(reference)
+    box_time = np.linspace(*T_BOUNDS, spatial_points)
+    volume_t, volume_y, volume_x = np.meshgrid(box_time, y, x, indexing="ij")
+    volume_points = torch.tensor(np.column_stack((volume_x.ravel(), volume_y.ravel(), volume_t.ravel())), dtype=torch.float32, device=device)
+    predicted_chunks, reference_chunks = [], []
+    with torch.no_grad():
+        for start in range(0, volume_points.shape[0], 32768):
+            chunk = volume_points[start:start + 32768]
+            predicted_chunks.append(model(chunk).cpu()); reference_chunks.append(exact_solution(chunk).cpu())
+        validation_prediction = model(validation).cpu().numpy()
+        validation_reference = exact_solution(validation).cpu().numpy()
+    volume_prediction = torch.cat(predicted_chunks).numpy().reshape(volume_t.shape)
+    volume_reference = torch.cat(reference_chunks).numpy().reshape(volume_t.shape)
+    output.mkdir(parents=True, exist_ok=True)
+    payload = dict(x=x, y=y, time=times, prediction=prediction, reference=reference,
+                   absolute_error=np.abs(prediction-reference), box_time=box_time,
+                   volume_prediction=volume_prediction, volume_reference=volume_reference,
+                   volume_error=np.abs(volume_prediction-volume_reference),
+                   validation_points=validation.cpu().numpy(), validation_prediction=validation_prediction,
+                   validation_reference=validation_reference, validation_relative_l2_error=relative_error,
+                   training_wall_time_seconds=wall_time)
+    payload.update({key: np.asarray(value) for key, value in metadata.items()})
+    np.savez_compressed(output / f"{stem}_solution_data.npz", **payload)
+    loss = np.asarray(history)
+    training_payload = dict(
+        epoch=np.arange(1, loss.size + 1),
+        loss=loss,
+        interior_epoch=np.arange(1, loss.size + 1),
+        interior_loss=loss,
+        training_wall_time_seconds=wall_time,
+    )
+    for name, values in (condition_history or {}).items():
+        values = np.asarray(values)
+        training_payload[f"{name}_epoch"] = np.arange(1, values.size + 1)
+        training_payload[f"{name}_loss"] = values
+    np.savez_compressed(
+        output / f"{stem}_training_data.npz", **training_payload
+    )
+    print(f"Saved solution data to: {output / f'{stem}_solution_data.npz'}")
+    print(f"Saved training data to: {output / f'{stem}_training_data.npz'}")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "bspline_config.json"
@@ -116,39 +218,14 @@ def basis_and_derivatives(values, knots, degree):
     return basis, first, second
 
 
-def greville_abscissae(knots, degree):
-    """Return one Greville point per basis function."""
-    n_basis = knots.numel() - degree - 1
-    points = torch.stack([
-        knots[index + 1:index + degree + 1].mean()
-        for index in range(n_basis)
-    ])
-    points[0] = knots[degree]
-    points[-1] = knots[-degree - 1]
-    return points
-
-
-def tensor_product_interpolation(first_matrix, second_matrix, targets):
-    """Solve B1 C B2^T=G for a coefficient surface C."""
-    intermediate = torch.linalg.solve(first_matrix, targets)
-    return torch.linalg.solve(second_matrix, intermediate.T).T
-
-
 class KleinGordonBSpline(torch.nn.Module):
-    """Tensor spline with Greville-frozen boundary and initial coefficients."""
+    """Tensor spline with optionally pretrained and frozen condition traces."""
 
     def __init__(self, n_basis_space, n_basis_time, degree, constraint_mode,
                  device, enforce_initial_velocity=ENFORCE_INITIAL_VELOCITY):
         super().__init__()
         if constraint_mode not in ("soft", "hard"):
             raise ValueError("constraint_mode must be 'soft' or 'hard'")
-        if constraint_mode == "hard" and enforce_initial_velocity:
-            raise ValueError(
-                "Greville interpolation of the time-dependent boundary and an "
-                "exact initial velocity generally constrain the same second "
-                "time-layer coefficients incompatibly. Use the paper setting "
-                "enforce_initial_velocity=false."
-            )
         self.n_basis_space = n_basis_space
         self.n_basis_time = n_basis_time
         self.degree = degree
@@ -159,51 +236,69 @@ class KleinGordonBSpline(torch.nn.Module):
         self.register_buffer("knot_t", clamped_uniform_knots(T_BOUNDS, n_basis_time, degree, device))
 
         shape = (n_basis_space, n_basis_space, n_basis_time)
+        fixed = torch.zeros(shape, device=device)
+        boundary_mask = torch.zeros(shape, dtype=torch.bool, device=device)
         if constraint_mode == "hard":
-            fixed, fixed_mask = self._greville_boundary_coefficients()
-        else:
-            fixed = torch.zeros(shape, device=device)
-            fixed_mask = torch.zeros(shape, dtype=torch.bool, device=device)
+            boundary_mask[0, :, :] = True
+            boundary_mask[-1, :, :] = True
+            boundary_mask[:, 0, :] = True
+            boundary_mask[:, -1, :] = True
+        initial_mask = torch.zeros_like(boundary_mask)
+        if constraint_mode == "hard":
+            initial_mask[:, :, 0] = True
+            initial_mask &= ~boundary_mask
+        velocity_mask = torch.zeros_like(boundary_mask)
+        if constraint_mode == "hard" and enforce_initial_velocity:
+            velocity_mask[:, :, 1] = True
+            velocity_mask &= ~(boundary_mask | initial_mask)
+        fixed_mask = boundary_mask | initial_mask | velocity_mask
+        boundary_indices = boundary_mask.flatten().nonzero(
+            as_tuple=False
+        ).squeeze(1)
+        initial_indices = initial_mask.flatten().nonzero(
+            as_tuple=False
+        ).squeeze(1)
+        velocity_indices = velocity_mask.flatten().nonzero(
+            as_tuple=False
+        ).squeeze(1)
         free_indices = (~fixed_mask).flatten().nonzero(as_tuple=False).squeeze(1)
         self.register_buffer("fixed_coefficients", fixed)
         self.register_buffer("fixed_mask", fixed_mask)
+        self.register_buffer("boundary_indices", boundary_indices)
+        self.register_buffer("initial_indices", initial_indices)
+        self.register_buffer("velocity_indices", velocity_indices)
         self.register_buffer("free_indices", free_indices)
+        self.boundary_coefficients = torch.nn.Parameter(
+            torch.zeros(boundary_indices.numel(), device=device),
+            requires_grad=constraint_mode == "hard",
+        )
+        self.initial_coefficients = torch.nn.Parameter(
+            torch.zeros(initial_indices.numel(), device=device),
+            requires_grad=constraint_mode == "hard",
+        )
+        self.velocity_coefficients = torch.nn.Parameter(
+            torch.zeros(velocity_indices.numel(), device=device),
+            requires_grad=(
+                constraint_mode == "hard" and enforce_initial_velocity
+            ),
+        )
         self.interior_coefficients = torch.nn.Parameter(
             0.01 * torch.randn(free_indices.numel(), device=device)
         )
 
-    def _greville_boundary_coefficients(self):
-        """Interpolate the four spatial faces and t=0 coefficient face."""
-        xg = greville_abscissae(self.knot_x, self.degree)
-        yg = greville_abscissae(self.knot_y, self.degree)
-        tg = greville_abscissae(self.knot_t, self.degree)
-        bx = basis_matrix(xg, self.knot_x, self.degree)
-        by = basis_matrix(yg, self.knot_y, self.degree)
-        bt = basis_matrix(tg, self.knot_t, self.degree)
-        sums = torch.zeros(self.n_basis_space, self.n_basis_space, self.n_basis_time, device=xg.device)
-        counts = torch.zeros_like(sums)
+    def staged_coefficient_tensor(self, indices, values):
+        """Insert the active preprocessing variables into the fixed tensor."""
+        flat = self.fixed_coefficients.flatten()
+        flat = flat.scatter(0, indices, values)
+        return flat.reshape(self.fixed_coefficients.shape)
 
-        def face(first, second, first_basis, second_basis, builder):
-            grid_first, grid_second = torch.meshgrid(first, second, indexing="ij")
-            points = builder(grid_first.reshape(-1), grid_second.reshape(-1))
-            targets = exact_solution(points).reshape(first.numel(), second.numel())
-            return tensor_product_interpolation(first_basis, second_basis, targets)
-
-        x_left = face(yg, tg, by, bt, lambda y, t: torch.stack((torch.full_like(y, X_BOUNDS[0]), y, t), 1))
-        x_right = face(yg, tg, by, bt, lambda y, t: torch.stack((torch.full_like(y, X_BOUNDS[1]), y, t), 1))
-        y_bottom = face(xg, tg, bx, bt, lambda x, t: torch.stack((x, torch.full_like(x, Y_BOUNDS[0]), t), 1))
-        y_top = face(xg, tg, bx, bt, lambda x, t: torch.stack((x, torch.full_like(x, Y_BOUNDS[1]), t), 1))
-        grid_x, grid_y = torch.meshgrid(xg, yg, indexing="ij")
-        initial_face = tensor_product_interpolation(bx, by, initial_value_xy(grid_x, grid_y))
-
-        sums[0, :, :] += x_left; counts[0, :, :] += 1.0
-        sums[-1, :, :] += x_right; counts[-1, :, :] += 1.0
-        sums[:, 0, :] += y_bottom; counts[:, 0, :] += 1.0
-        sums[:, -1, :] += y_top; counts[:, -1, :] += 1.0
-        sums[:, :, 0] += initial_face; counts[:, :, 0] += 1.0
-        mask = counts > 0
-        fixed = torch.where(mask, sums / counts.clamp_min(1.0), torch.zeros_like(sums))
-        return fixed.detach(), mask
+    def freeze_stage(self, indices, values):
+        """Copy one pretrained coefficient stage into the fixed tensor."""
+        with torch.no_grad():
+            self.fixed_coefficients.copy_(
+                self.staged_coefficient_tensor(indices, values)
+            )
+        values.requires_grad_(False)
 
     def coefficient_tensor(self):
         """Insert trainable interior values into the frozen tensor."""
@@ -268,6 +363,127 @@ def bspline_loss(model, interior_operators, interior_points,
             + weights["boundary"] * boundary_loss)
 
 
+def boundary_pretraining_loss(model, operators, points):
+    coefficients = model.staged_coefficient_tensor(
+        model.boundary_indices, model.boundary_coefficients
+    )
+    prediction = field_values(coefficients, operators)[0]
+    return (prediction - exact_solution(points)).square().mean()
+
+
+def initial_value_pretraining_loss(model, operators, points):
+    coefficients = model.staged_coefficient_tensor(
+        model.initial_indices, model.initial_coefficients
+    )
+    prediction = field_values(coefficients, operators)[0]
+    target = initial_value_xy(points[:, 0], points[:, 1])
+    return (prediction - target).square().mean()
+
+
+def initial_velocity_pretraining_loss(model, operators, points):
+    coefficients = model.staged_coefficient_tensor(
+        model.velocity_indices, model.velocity_coefficients
+    )
+    prediction = field_values(coefficients, operators)[3]
+    target = initial_velocity_xy(points[:, 0], points[:, 1])
+    return (prediction - target).square().mean()
+
+
+def _train_condition_stage(
+    parameters,
+    loss_function,
+    *,
+    epochs,
+    learning_rate,
+    scheduler_config,
+    stopping_config,
+    print_every,
+):
+    optimizer = torch.optim.Adam([parameters], lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=float(scheduler_config["factor"]),
+        patience=int(scheduler_config["patience"]),
+        min_lr=float(scheduler_config["min_learning_rate"]),
+    )
+    return train(
+        [parameters],
+        loss_function,
+        optimizer,
+        epochs=epochs,
+        scheduler=scheduler,
+        early_stopping_patience=int(stopping_config["patience"]),
+        min_delta=float(stopping_config["min_delta"]),
+        print_every=print_every,
+    )
+
+
+def pretrain_condition_coefficients(
+    model,
+    constraint_operators,
+    constraints,
+    *,
+    epochs,
+    learning_rate,
+    scheduler_config,
+    stopping_config,
+    print_every,
+):
+    """Sequentially fit the BC, initial-value and initial-velocity surfaces."""
+    if model.constraint_mode != "hard":
+        return {}
+    histories = {}
+    histories["boundary"] = _train_condition_stage(
+        model.boundary_coefficients,
+        lambda: boundary_pretraining_loss(
+            model,
+            constraint_operators["boundary"],
+            constraints["boundary"],
+        ),
+        epochs=epochs,
+        learning_rate=learning_rate,
+        scheduler_config=scheduler_config,
+        stopping_config=stopping_config,
+        print_every=print_every,
+    )
+    model.freeze_stage(
+        model.boundary_indices, model.boundary_coefficients
+    )
+    histories["initial_value"] = _train_condition_stage(
+        model.initial_coefficients,
+        lambda: initial_value_pretraining_loss(
+            model,
+            constraint_operators["initial"],
+            constraints["initial"],
+        ),
+        epochs=epochs,
+        learning_rate=learning_rate,
+        scheduler_config=scheduler_config,
+        stopping_config=stopping_config,
+        print_every=print_every,
+    )
+    model.freeze_stage(model.initial_indices, model.initial_coefficients)
+    if model.enforce_initial_velocity:
+        histories["initial_velocity"] = _train_condition_stage(
+            model.velocity_coefficients,
+            lambda: initial_velocity_pretraining_loss(
+                model,
+                constraint_operators["initial"],
+                constraints["initial"],
+            ),
+            epochs=epochs,
+            learning_rate=learning_rate,
+            scheduler_config=scheduler_config,
+            stopping_config=stopping_config,
+            print_every=print_every,
+        )
+        model.freeze_stage(
+            model.velocity_indices, model.velocity_coefficients
+        )
+    return histories
+
+
 def bspline_constraint_errors(model, constraints, constraint_operators):
     with torch.no_grad():
         coefficients = model.coefficient_tensor()
@@ -291,8 +507,9 @@ def load_hyperparameters(path=RESULT_PATH):
 def main(device_name=DEFAULT_DEVICE, n_basis_space=N_BASIS_SPACE,
          n_basis_time=N_BASIS_TIME, degree=DEGREE,
          constraint_mode=CONSTRAINT_MODE, epochs=int(TRAINING["epochs"]),
-         use_tuned=None):
-    set_seed(SEED)
+         use_tuned=None, initialization_seed=SEED, sampling_seed=SEED,
+         validation_seed=None, save_outputs=True, verbose=True):
+    set_seed(initialization_seed)
     device = select_device(device_name)
     should_load = (LOAD_TUNED_IF_AVAILABLE and RESULT_PATH.exists()
                    and RESULT_PATH.stat().st_size > 3
@@ -303,15 +520,40 @@ def main(device_name=DEFAULT_DEVICE, n_basis_space=N_BASIS_SPACE,
     print(f"Using device: {device}")
     print(f"Klein-Gordon B-spline: n_space={n_basis_space}, n_time={n_basis_time}, degree={degree}, constraints={constraint_mode}")
     model = KleinGordonBSpline(n_basis_space, n_basis_time, degree, constraint_mode, device).to(device)
-    generator = torch.Generator(device=device).manual_seed(SEED)
+    generator = torch.Generator(device=device).manual_seed(sampling_seed)
     interior = sample_interior(int(SAMPLING["interior_points"]), device, generator)
     constraints = sample_constraints(int(SAMPLING["boundary_points_per_face"]), int(SAMPLING["initial_points"]), device, generator)
     interior_operators = precompute_operators(model, interior)
     constraint_operators = {name: precompute_operators(model, points) for name, points in constraints.items()}
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    start = time.perf_counter()
+    condition_history = {}
+    if constraint_mode == "hard":
+        print(
+            "Stage 1/2: sequentially pretraining BC, initial-value, "
+            "and initial-velocity coefficients"
+        )
+        condition_history = pretrain_condition_coefficients(
+            model,
+            constraint_operators,
+            constraints,
+            epochs=epochs,
+            learning_rate=float(TRAINING["learning_rate"]),
+            scheduler_config=TRAINING["scheduler"],
+            stopping_config=TRAINING["early_stopping"],
+            print_every=int(TRAINING["print_every"]),
+        )
     before = bspline_constraint_errors(model, constraints, constraint_operators)
-    print(f"Greville-frozen errors before training: initial={before[0].item():.3e}, boundary={before[2].item():.3e}")
+    print(f"Frozen-condition errors before PDE training: initial={before[0].item():.3e}, boundary={before[2].item():.3e}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(TRAINING["learning_rate"]))
+    print("Stage 2/2: optimizing the PDE-interior coefficients")
+    pde_parameters = (
+        [model.interior_coefficients]
+        if constraint_mode == "hard"
+        else list(model.parameters())
+    )
+    optimizer = torch.optim.Adam(pde_parameters, lr=float(TRAINING["learning_rate"]))
     schedule = TRAINING["scheduler"]
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=float(schedule["factor"]),
@@ -319,33 +561,43 @@ def main(device_name=DEFAULT_DEVICE, n_basis_space=N_BASIS_SPACE,
     )
     stopping = TRAINING["early_stopping"]
     history = train(
-        model.parameters(),
+        pde_parameters,
         lambda: bspline_loss(model, interior_operators, interior, constraint_operators, constraints),
         optimizer, epochs=epochs, scheduler=scheduler,
         early_stopping_patience=int(stopping["patience"]),
         min_delta=float(stopping["min_delta"]),
         print_every=int(TRAINING["print_every"]),
     )
-    validation = sample_interior(int(SAMPLING["validation_points"]), device, generator)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    wall_time = time.perf_counter() - start
+    validation_generator = generator if validation_seed is None else torch.Generator(device=device).manual_seed(validation_seed)
+    validation = sample_interior(int(SAMPLING["validation_points"]), device, validation_generator)
     validation_operators = precompute_operators(model, validation)
     relative_error = relative_l2_error(model, validation)
     residual_mse = bspline_residual(model, validation_operators, validation).detach().square().mean()
     value_error, velocity_error, boundary_error = bspline_constraint_errors(model, constraints, constraint_operators)
     print(f"Relative validation L2 error: {relative_error.item():.6e}")
+    print(f"Training wall time: {wall_time:.3f} s")
     print(f"Validation PDE residual MSE: {residual_mse.item():.6e}")
     print(f"Maximum initial-value error: {value_error.item():.6e}")
     velocity_label = "Maximum initial-velocity error" if ENFORCE_INITIAL_VELOCITY else "Initial-velocity diagnostic (not enforced)"
     print(f"{velocity_label}: {velocity_error.item():.6e}")
-    print(f"Maximum boundary interpolation error: {boundary_error.item():.6e}")
+    print(f"Maximum frozen-boundary error: {boundary_error.item():.6e}")
+    result = {"validation_relative_l2_error": relative_error.item(), "training_time_seconds": wall_time}
+    if not save_outputs:
+        return result
     save_results(
-        model, history, relative_error.item(), POSTPROCESSING_DIR,
+        model, history, relative_error.item(), validation, wall_time, POSTPROCESSING_DIR,
         f"bspline_klein_gordon_{constraint_mode}",
         f"Klein-Gordon B-spline ({constraint_mode})",
         int(SAMPLING["plot_spatial_points"]), list(SAMPLING["plot_times"]),
         {"constraint_mode": constraint_mode, "n_basis_space": n_basis_space,
          "n_basis_time": n_basis_time, "degree": degree},
         bool(CONFIG["output"]["show_plots"]),
+        condition_history,
     )
+    return result
 
 
 if __name__ == "__main__":

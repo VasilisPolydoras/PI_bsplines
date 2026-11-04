@@ -44,6 +44,7 @@ N_VALIDATION_POINTS = int(TUNING_CONFIG["validation_points"])
 N_BOUNDARY_POINTS_PER_EDGE = int(
     TUNING_CONFIG["boundary_points_per_edge"]
 )
+N_INITIAL_POINTS = int(TUNING_CONFIG["initial_points"])
 N_LAYERS_MIN = int(TUNING_CONFIG["n_layers"]["min"])
 N_LAYERS_MAX = int(TUNING_CONFIG["n_layers"]["max"])
 N_NEURONS_MIN = int(TUNING_CONFIG["n_neurons"]["min"])
@@ -139,7 +140,7 @@ def main(
         N_VALIDATION_POINTS, device, generator
     )
     constraint_points = sample_constraints(
-        N_BOUNDARY_POINTS_PER_EDGE, device
+        N_BOUNDARY_POINTS_PER_EDGE, N_INITIAL_POINTS, device
     )
     print("Computing the validation reference solution once")
     validation_reference = numerical_reference_at_points(validation_points)

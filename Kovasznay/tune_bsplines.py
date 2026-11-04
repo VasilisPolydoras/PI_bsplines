@@ -17,11 +17,13 @@ from Kovasznay.Bspline_2D import (
     CONFIG,
     DEFAULT_DEVICE,
     HYPERPARAMETER_PATH,
+    INTERIOR_INITIALIZATION,
     INTERIOR_LEARNING_RATE,
     SEED,
     bsplines,
     exact_solution,
-    kovasznay_loss,
+    kovasznay_pde_loss,
+    pretrain_boundary_coefficients,
     precompute_operators,
     sample_boundary,
     sample_interior,
@@ -52,20 +54,25 @@ def make_objective(
     device, tuning_epochs=TUNING_EPOCHS,
 ):
     def objective(trial):
-        n_basis = trial.suggest_int(
-            "n_basis", int(TUNING["n_basis"]["min"]),
-            int(TUNING["n_basis"]["max"]),
-        )
         degree = trial.suggest_int(
             "degree", int(TUNING["degree"]["min"]),
             int(TUNING["degree"]["max"]),
         )
+        n_basis = trial.suggest_int(
+            "n_basis", max(degree + 1, int(TUNING["n_basis"]["min"])),
+            int(TUNING["n_basis"]["max"]),
+        )
         set_seed(SEED)
+        boundary_coefficients, _ = pretrain_boundary_coefficients(
+            n_basis, degree, train_boundary, device, epochs=tuning_epochs,
+        )
         model = bsplines(n_basis, degree, device)
+        model.set_boundary_coefficients(
+            boundary_coefficients, INTERIOR_INITIALIZATION
+        )
         train_operators = precompute_operators(model, train_points)
-        validation_operators = precompute_operators(model, validation_points)
         optimizer = torch.optim.Adam(
-            [model.coeffs], lr=INTERIOR_LEARNING_RATE
+            [model.interior_coeffs], lr=INTERIOR_LEARNING_RATE
         )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
@@ -76,10 +83,10 @@ def make_objective(
         )
 
         def loss_fn():
-            return kovasznay_loss(model, train_operators, train_boundary)
+            return kovasznay_pde_loss(model, train_operators)
 
         train(
-            [model.coeffs], loss_fn, optimizer,
+            [model.interior_coeffs], loss_fn, optimizer,
             epochs=tuning_epochs,
             scheduler=scheduler,
             early_stopping_patience=int(
@@ -89,9 +96,6 @@ def make_objective(
             print_every=0,
         )
         with torch.no_grad():
-            validation_loss = kovasznay_loss(
-                model, validation_operators, validation_boundary
-            ).item()
             training_loss = loss_fn().item()
             prediction = model.forward(validation_points)
             reference = exact_solution(validation_points)
@@ -100,7 +104,6 @@ def make_objective(
                 / torch.linalg.vector_norm(reference, dim=0)
             )
         trial.set_user_attr("train_loss", training_loss)
-        trial.set_user_attr("validation_physics_loss", validation_loss)
         trial.set_user_attr(
             "field_relative_l2", relative_errors.cpu().tolist()
         )

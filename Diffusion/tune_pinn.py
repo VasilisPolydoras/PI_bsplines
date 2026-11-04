@@ -1,10 +1,88 @@
-"""Tune forward diffusion PINN."""
-import argparse,json,optuna,torch
-from PINN_2D import CONFIG,RESULT_PATH,DiffusionPINN
-from _common import boundary,device_from,initial,physics_loss,relative_l2,sample,set_seed,train
-def main(device_name=None,mode="hard",trials=None,epochs=None):
- d=device_from(device_name or CONFIG["runtime"]["device"]);q=CONFIG["tuning"];seed=int(CONFIG["reproducibility"]["seed"]);a=float(CONFIG["problem"]["diffusivity"]);g=torch.Generator(device=d).manual_seed(seed);inside=sample(q["interior_points"],d,g);bc=boundary(q["boundary_points"],d,g);ic=initial(q["initial_points"],d);valid=sample(q["validation_points"],d,g)
- def objective(t):
-  set_seed(seed);m=DiffusionPINN(t.suggest_int("n_layers",q["n_layers"]["min"],q["n_layers"]["max"]),t.suggest_int("n_neurons",q["n_neurons"]["min"],q["n_neurons"]["max"],step=q["n_neurons"]["step"]),mode).to(d);c=dict(CONFIG["training"]);c["epochs"]=int(epochs or q["epochs"]);c["print_every"]=0;train(m,lambda:physics_loss(m,inside,bc,ic,a,CONFIG["loss_weights"]),c);return float(relative_l2(m,valid,a))
- s=optuna.create_study(direction="minimize",sampler=optuna.samplers.TPESampler(seed=seed));s.optimize(objective,n_trials=int(trials or q["trials"]));payload=json.loads(RESULT_PATH.read_text()) if RESULT_PATH.exists() else {};payload[mode]={"best_value":s.best_value,"best_params":s.best_params};RESULT_PATH.write_text(json.dumps(payload,indent=2));print(f"Saved: {RESULT_PATH}")
-if __name__=="__main__":p=argparse.ArgumentParser();p.add_argument("--device",choices=("cpu","gpu"));p.add_argument("--constraint",choices=("hard","soft"),default="hard");p.add_argument("--trials",type=int);p.add_argument("--epochs",type=int);x=p.parse_args();main(x.device,x.constraint,x.trials,x.epochs)
+"""Tune the diffusion PINN with a seeded Optuna study."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import optuna
+import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from hyperparameter_optimization import run_tpe_study
+from training import train
+from Diffusion.PINN_2D import (
+    CONFIG, DIFFUSIVITY, LEARNING_RATE, RESULT_PATH, SEED, DiffusionPINN,
+    pinn_loss, relative_l2_error, sample_constraints, sample_interior,
+    select_device, set_seed,
+)
+
+
+def main(device_name=None, constraint_mode=None, trials=None, epochs=None) -> None:
+    tuning = CONFIG["tuning"]
+    mode = constraint_mode or CONFIG["model"]["constraint_mode"]
+    device = select_device(device_name or CONFIG["runtime"]["device"])
+    generator = torch.Generator(device=device).manual_seed(SEED)
+    interior = sample_interior(
+        int(tuning["training_points"]), device, generator=generator
+    )
+    validation = sample_interior(
+        int(tuning["validation_points"]), device, generator=generator
+    )
+    constraints = sample_constraints(
+        int(tuning["boundary_points_per_edge"]), int(tuning["initial_points"]),
+        device,
+    )
+
+    def objective(trial: optuna.Trial) -> float:
+        set_seed(SEED)
+        model = DiffusionPINN(
+            trial.suggest_int(
+                "n_layers", int(tuning["n_layers"]["min"]),
+                int(tuning["n_layers"]["max"]),
+            ),
+            trial.suggest_int(
+                "n_neurons", int(tuning["n_neurons"]["min"]),
+                int(tuning["n_neurons"]["max"]),
+                step=int(tuning["n_neurons"]["step"]),
+            ),
+            mode,
+        ).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+        scheduler_config = tuning["scheduler"]
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, factor=float(scheduler_config["factor"]),
+            patience=int(scheduler_config["patience"]),
+            min_lr=float(scheduler_config["min_learning_rate"]),
+        )
+        stopping = tuning["early_stopping"]
+        train(
+            model.parameters(), lambda: pinn_loss(model, interior, constraints),
+            optimizer, epochs=int(epochs or tuning["epochs"]), scheduler=scheduler,
+            early_stopping_patience=int(stopping["patience"]),
+            min_delta=float(stopping["min_delta"]), print_every=0,
+        )
+        return float(relative_l2_error(model, validation, DIFFUSIVITY))
+
+    study = run_tpe_study(
+        objective, n_trials=int(trials or tuning["trials"]), seed=SEED,
+        direction="minimize", result_path=RESULT_PATH,
+    )
+    print(f"Constraint mode: {mode}")
+    print(f"Best validation relative L2 error: {study.best_value:.6e}")
+    print(f"Best hyperparameters: {study.best_params}")
+    print(f"Saved: {RESULT_PATH}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Tune the diffusion PINN")
+    parser.add_argument("--device", choices=("cpu", "gpu"))
+    parser.add_argument("--constraint", choices=("hard", "soft"))
+    parser.add_argument("--trials", type=int)
+    parser.add_argument("--epochs", type=int)
+    arguments = parser.parse_args()
+    main(arguments.device, arguments.constraint, arguments.trials, arguments.epochs)
