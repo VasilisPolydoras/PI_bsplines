@@ -6,7 +6,7 @@ __pycache__/
 *.pdf
 *.png
 *.pptx
-*.txt
+latex.txt
 *.ppt
 *.pth
 *.pt
