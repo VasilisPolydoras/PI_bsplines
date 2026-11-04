@@ -1,0 +1,51 @@
+{
+  "reproducibility": {"seed": 42},
+  "runtime": {"device": "gpu", "load_tuned_if_available": true},
+  "problem": {
+    "reynolds_number": 40.0,
+    "x_bounds": [-0.5, 1.0],
+    "y_bounds": [-0.5, 1.5]
+  },
+  "model": {
+    "n_layers": 2,
+    "n_neurons": 10,
+    "grid": 5,
+    "spline_order": 3,
+    "constraint_mode": "hard"
+  },
+  "sampling": {
+    "interior_points": 30000,
+    "boundary_points_per_edge": 250,
+    "validation_points": 6000,
+    "plot_x_points": 150,
+    "plot_y_points": 150
+  },
+  "loss_weights": {"pde": 1.0, "boundary": 1.0},
+  "training": {
+    "optimizer": "Adam",
+    "epochs": 100000,
+    "learning_rate": 0.001,
+    "scheduler": {"factor": 0.8, "patience": 50, "min_learning_rate": 0.00001},
+    "early_stopping": {"patience": 500, "min_delta": 1e-9},
+    "print_every": 100
+  },
+  "tuning": {
+    "objective": "mean_relative_l2_error",
+    "trials": 50,
+    "epochs": 500,
+    "training_points": 500,
+    "validation_points": 2000,
+    "boundary_points_per_edge": 100,
+    "n_layers": {"min": 1, "max": 3},
+    "n_neurons": {"min": 3, "max": 8},
+    "grid": {"min": 3, "max": 6},
+    "spline_order": {"min": 2, "max": 4},
+    "scheduler": {"factor": 0.8, "patience": 50, "min_learning_rate": 0.00001},
+    "early_stopping": {"patience": 500, "min_delta": 1e-9}
+  },
+  "output": {
+    "tuned_hyperparameters": "pikan_hyper_tuned.json",
+    "postprocessing_directory": "postprocessing",
+    "show_plots": true
+  }
+}

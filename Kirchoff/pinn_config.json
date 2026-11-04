@@ -1,0 +1,33 @@
+{
+  "reproducibility": {"seed": 42},
+  "runtime": {"device": "gpu", "load_tuned_if_available": true},
+  "problem": {
+    "length_x": 10.0, "length_y": 10.0, "load_amplitude": 0.015,
+    "youngs_modulus": 30000.0, "thickness": 0.2, "poisson_ratio": 0.2
+  },
+  "model": {"n_layers": 4, "n_neurons": 64, "activation": "tanh", "constraint_mode": "soft"},
+  "sampling": {
+    "interior_points": 30000, "boundary_points_per_edge": 250,
+    "validation_points": 6000, "plot_points_per_axis": 150
+  },
+  "loss_weights": {"pde": 1.0, "deflection": 1.0, "moment": 1.0},
+  "training": {
+    "optimizer": "Adam", "epochs": 100000, "learning_rate": 0.001,
+    "scheduler": {"factor": 0.8, "patience": 50, "min_learning_rate": 0.00001},
+    "early_stopping": {"patience": 500, "min_delta": 1e-9},
+    "print_every": 100
+  },
+  "tuning": {
+    "objective": "relative_l2_error", "trials": 50, "epochs": 2000,
+    "training_points": 1000, "validation_points": 2000,
+    "boundary_points_per_edge": 100,
+    "n_layers": {"min": 2, "max": 5},
+    "n_neurons": {"min": 20, "max": 100, "step": 20},
+    "scheduler": {"factor": 0.8, "patience": 50, "min_learning_rate": 0.00001},
+    "early_stopping": {"patience": 500, "min_delta": 1e-9}
+  },
+  "output": {
+    "tuned_hyperparameters": "pinn_hyper_tuned.json",
+    "postprocessing_directory": "postprocessing", "show_plots": true
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "reproducibility": {
+    "seed": 42
+  },
+  "runtime": {
+    "device": "gpu",
+    "load_tuned_if_available": true
+  },
+  "problem": {
+    "x_bounds": [-1.0, 1.0],
+    "time_bounds": [0.0, 1.0],
+    "viscosity": 0.003183098861837907
+  },
+  "model": {
+    "n_basis_x": 80,
+    "n_basis_t": 30,
+    "degree": 5,
+    "spatial_clustering": 3.6
+  },
+  "sampling": {
+    "interior_points": 30000,
+    "boundary_points_per_edge": 250,
+    "plot_spatial_points": 150,
+    "plot_time_points": 150,
+    "reference_spatial_points": 501
+  },
+  "training": {
+    "optimizer": "Adam",
+    "epochs": 100000,
+    "learning_rate": 0.001,
+    "scheduler": {
+      "factor": 0.8,
+      "patience": 50,
+      "min_learning_rate": 0.00001
+    },
+    "early_stopping": {
+      "patience": 500,
+      "min_delta": 1e-8
+    },
+    "print_every": 100
+  },
+  "tuning": {
+    "objective": "relative_l2_error",
+    "trials": 50,
+    "epochs": 10000,
+    "training_points": 2000,
+    "validation_points": 6000,
+    "scheduler": {
+      "factor": 0.8,
+      "patience": 50,
+      "min_learning_rate": 0.00001
+    },
+    "early_stopping": {
+      "patience": 500,
+      "min_delta": 1e-9
+    },
+    "n_basis_x": {
+      "min": 24,
+      "max": 80
+    },
+    "n_basis_t": {
+      "min": 10,
+      "max": 30
+    },
+    "degree": {
+      "min": 2,
+      "max": 4
+    },
+    "spatial_clustering": {
+      "min": 0.0,
+      "max": 5.0,
+      "step": 0.1
+    }
+  },
+  "output": {
+    "tuned_hyperparameters": "bspline_hyper_tuned.json",
+    "postprocessing_directory": "postprocessing",
+    "show_plots": true
+  }
+}

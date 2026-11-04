@@ -1,0 +1,15 @@
+{
+  "soft": {
+    "best_value": 0.6995306710402172,
+    "best_params": {
+      "n_layers": 1,
+      "n_neurons": 7,
+      "grid": 3,
+      "spline_order": 4
+    },
+    "best_metrics": {
+      "field_relative_l2": 0.17523811757564545,
+      "parameter_relative_error": 0.5242925534645717
+    }
+  }
+}

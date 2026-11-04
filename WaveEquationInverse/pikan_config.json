@@ -1,0 +1,24 @@
+{
+  "reproducibility": {"seed": 42},
+  "runtime": {"device": "gpu", "load_tuned_if_available": true},
+  "problem": {"x_bounds": [0.0, 1.0], "time_bounds": [0.0, 1.0], "true_wave_speed": 1.0},
+  "inverse": {"initial_wave_speed": 0.5, "minimum_wave_speed": 1e-7, "noise_std": 0.0},
+  "model": {"n_layers": 2, "n_neurons": 10, "grid": 5, "spline_order": 3, "constraint_mode": "soft"},
+  "sampling": {"interior_points": 30000, "sensor_points": 250, "boundary_points_per_edge": 250, "initial_points": 250, "validation_points": 6000, "plot_spatial_points": 150, "plot_time_points": 150},
+  "loss_weights": {"pde": 1.0, "data": 1.0, "boundary": 1.0, "initial_displacement": 1.0, "initial_velocity": 1.0},
+  "training": {
+    "optimizer": "Adam", "epochs": 100000, "learning_rate": 0.001,
+    "scheduler": {"factor": 0.8, "patience": 50, "min_learning_rate": 0.00001},
+    "early_stopping": {"patience": 500, "min_delta": 1e-9}, "print_every": 100
+  },
+  "tuning": {
+    "objective": "field_plus_parameter_relative_error", "trials": 50, "epochs": 500,
+    "training_points": 500, "sensor_points": 100, "validation_points": 2000,
+    "boundary_points_per_edge": 100, "initial_points": 100,
+    "n_layers": {"min": 1, "max": 3}, "n_neurons": {"min": 3, "max": 8},
+    "grid": {"min": 3, "max": 6}, "spline_order": {"min": 2, "max": 4},
+    "scheduler": {"factor": 0.8, "patience": 50, "min_learning_rate": 0.00001},
+    "early_stopping": {"patience": 500, "min_delta": 1e-9}
+  },
+  "output": {"tuned_hyperparameters": "pikan_hyper_tuned.json", "postprocessing_directory": "postprocessing", "show_plots": true}
+}

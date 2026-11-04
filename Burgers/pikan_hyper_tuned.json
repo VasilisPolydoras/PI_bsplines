@@ -1,0 +1,20 @@
+{
+  "hard": {
+    "status": "not_tuned",
+    "best_params": {
+      "n_layers": 2,
+      "n_neurons": 8,
+      "grid": 5,
+      "spline_order": 3
+    }
+  },
+  "soft": {
+    "status": "not_tuned",
+    "best_params": {
+      "n_layers": 2,
+      "n_neurons": 8,
+      "grid": 5,
+      "spline_order": 3
+    }
+  }
+}

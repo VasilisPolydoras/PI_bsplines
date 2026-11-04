@@ -10,7 +10,7 @@ latex.txt
 *.ppt
 *.pth
 *.pt
-*.json
+
 *.npz
 *.svg
 *.tex

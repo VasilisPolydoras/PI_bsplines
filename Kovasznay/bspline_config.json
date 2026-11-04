@@ -1,0 +1,50 @@
+{
+  "reproducibility": {"seed": 42},
+  "runtime": {"device": "gpu", "load_tuned_if_available": true},
+  "problem": {
+    "reynolds_number": 40.0,
+    "x_bounds": [-0.5, 1.0],
+    "y_bounds": [-0.5, 1.5]
+  },
+  "model": {"n_basis": 16, "degree": 5, "interior_initialization": "coons"},
+  "sampling": {
+    "interior_points": 30000,
+    "boundary_points_per_edge": 250,
+    "validation_points": 6000,
+    "plot_x_points": 150,
+    "plot_y_points": 150
+  },
+  "boundary_preprocessing": {
+    "epochs": 100000,
+    "learning_rate": 0.001,
+    "scheduler": {"factor": 0.8, "patience": 50, "min_learning_rate": 0.00001},
+    "early_stopping": {"patience": 500, "min_delta": 1e-9},
+    "print_every": 100
+  },
+  "training": {
+    "optimizer": "Adam",
+    "epochs": 100000,
+    "learning_rate": 0.001,
+    "scheduler": {"factor": 0.8, "patience": 50, "min_learning_rate": 0.00001},
+    "early_stopping": {"patience": 500, "min_delta": 1e-9},
+    "print_every": 100
+  },
+  "tuning": {
+    "objective": "mean_relative_l2_error",
+    "trials": 50,
+    "epochs": 20000,
+    "training_points": 1000,
+    "validation_points": 2000,
+    "training_boundary_points_per_edge": 100,
+    "validation_boundary_points_per_edge": 100,
+    "n_basis": {"min": 10, "max": 90},
+    "degree": {"min": 2, "max": 6},
+    "scheduler": {"factor": 0.8, "patience": 50, "min_learning_rate": 0.00001},
+    "early_stopping": {"patience": 500, "min_delta": 1e-9}
+  },
+  "output": {
+    "tuned_hyperparameters": "bspline_hyper_tuned.json",
+    "postprocessing_directory": "postprocessing",
+    "show_plots": true
+  }
+}

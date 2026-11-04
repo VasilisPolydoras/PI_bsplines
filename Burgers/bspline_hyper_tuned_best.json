@@ -1,0 +1,10 @@
+{
+  "best_value": 0.03614664822816849,
+  "best_params": {
+    "n_basis_x": 34,
+    "n_basis_t": 14,
+    "degree": 5,
+    "spatial_clustering": 4.7
+  },
+  "best_trial_number": 187
+}

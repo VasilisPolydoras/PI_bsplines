@@ -1,0 +1,8 @@
+{
+  "best_value": 0.00020369599224068224,
+  "best_params": {
+    "n_layers": 4,
+    "n_neurons": 80
+  },
+  "best_trial_number": 4
+}

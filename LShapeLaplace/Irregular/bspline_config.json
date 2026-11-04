@@ -1,0 +1,49 @@
+{
+  "reproducibility": {
+    "seed": 42
+  },
+  "runtime": {
+    "device": "gpu",
+    "load_tuned_if_available": true
+  },
+  "model": {
+    "n_basis": 8,
+    "degree": 5,
+    "knot_concentration": 1.0,
+    "corner_epsilon": 0.01,
+    "interior_initialization": "random"
+  },
+  "sampling": {
+    "interior_points_per_patch": 2000,
+    "boundary_points_per_edge": 250,
+    "interface_points": 500,
+    "validation_points_per_patch": 6000,
+    "validation_interface_points": 1001
+  },
+  "loss_weights": {
+    "pde": 1,
+    "interface_residual": 1.0,
+    "interface_flux": 1.0
+  },
+  "training": {
+    "optimizer": "Adam",
+    "epochs": 100000,
+    "learning_rate": 0.001,
+    "scheduler": {
+      "factor": 0.8,
+      "patience": 50,
+      "min_learning_rate": 0.00001
+    },
+    "early_stopping": {
+      "patience": 500,
+      "min_delta": 1e-9
+    },
+    "print_every": 100
+  },
+  "output": {
+    "tuned_hyperparameters": "bspline_hyper_tuned.json",
+    "postprocessing_directory": "postprocessing",
+    "plot_resolution": 101,
+    "show_plots": true
+  }
+}

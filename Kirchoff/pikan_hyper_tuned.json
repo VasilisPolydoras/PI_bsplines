@@ -1,0 +1,10 @@
+{
+  "best_value": 0.5604305267333984,
+  "best_params": {
+    "n_layers": 3,
+    "n_neurons": 6,
+    "grid": 3,
+    "spline_order": 5
+  },
+  "best_trial_number": 30
+}

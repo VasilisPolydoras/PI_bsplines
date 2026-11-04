@@ -1,0 +1,8 @@
+{
+  "best_value": 0.5645055770874023,
+  "best_params": {
+    "degree": 6,
+    "n_basis": 16
+  },
+  "best_trial_number": 40
+}
