@@ -76,7 +76,7 @@
     }
   },
   "output": {
-    "tuned_hyperparameters": "bspline_hyper_tuned.json",
+    "tuned_hyperparameters": "bspline_hyper_tuned_best.json",
     "postprocessing_directory": "postprocessing",
     "show_plots": true
   }

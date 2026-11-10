@@ -24,6 +24,49 @@ SOLVERS = {
     "pikan-hard": ("pikan_burgers_hard", "PIKAN hard"),
 }
 
+STATISTICS_FILES = {
+    "bspline": "bspline_statistics.npz",
+    "pinn-soft": "pinn_soft_statistics.npz",
+    "pinn-hard": "pinn_hard_statistics.npz",
+    "pikan-soft": "pikan_soft_statistics.npz",
+    "pikan-hard": "pikan_hard_statistics.npz",
+}
+
+
+def print_statistics(key: str) -> None:
+    """Print a saved repeated-run summary when it is available."""
+    path = HERE / STATISTICS_FILES[key]
+    if not path.exists():
+        print(f"No saved statistics for {key}: {path}")
+        return
+
+    with np.load(path, allow_pickle=False) as data:
+        required = {
+            "l2_errors", "l2_mean", "l2_std", "l2_ci95",
+            "time_mean_seconds", "time_std_seconds", "time_ci95_seconds",
+        }
+        missing = sorted(required.difference(data.files))
+        if missing:
+            print(
+                f"Statistics archive for {key} is missing: "
+                f"{', '.join(missing)}"
+            )
+            return
+        runs = int(data["l2_errors"].size)
+        l2_mean = float(data["l2_mean"])
+        l2_std = float(data["l2_std"])
+        l2_ci = np.asarray(data["l2_ci95"], dtype=float)
+        time_mean = float(data["time_mean_seconds"])
+        time_std = float(data["time_std_seconds"])
+        time_ci = np.asarray(data["time_ci95_seconds"], dtype=float)
+
+    _, title = SOLVERS[key]
+    print(f"\nSaved statistics: {title} ({runs} runs)")
+    print(f"  Relative L2 mean +/- std: {l2_mean:.6e} +/- {l2_std:.6e}")
+    print(f"  Relative L2 95% CI: [{l2_ci[0]:.6e}, {l2_ci[1]:.6e}]")
+    print(f"  Training time mean +/- std: {time_mean:.3f} +/- {time_std:.3f} s")
+    print(f"  Training-time 95% CI: [{time_ci[0]:.3f}, {time_ci[1]:.3f}] s")
+
 
 def load_solution(path: Path) -> dict[str, np.ndarray | float]:
     with np.load(path, allow_pickle=False) as data:
@@ -184,17 +227,17 @@ def main(solver: str, show: bool) -> None:
     for key in selected:
         stem, _ = SOLVERS[key]
         path = HERE / f"{stem}_solution_data.npz"
-        if not path.exists():
-            continue
-        record = load_solution(path)
-        timing = (
-            f"{float(record['wall_time']):.3f} s"
-            if np.isfinite(float(record["wall_time"])) else "unavailable"
-        )
-        print(
-            f"{key}: validation relative L2="
-            f"{float(record['l2_error']):.6e}, time={timing}"
-        )
+        if path.exists():
+            record = load_solution(path)
+            timing = (
+                f"{float(record['wall_time']):.3f} s"
+                if np.isfinite(float(record["wall_time"])) else "unavailable"
+            )
+            print(
+                f"{key}: validation relative L2="
+                f"{float(record['l2_error']):.6e}, time={timing}"
+            )
+        print_statistics(key)
     if show:
         plt.show()
     else:

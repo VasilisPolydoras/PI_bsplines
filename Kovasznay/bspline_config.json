@@ -6,7 +6,7 @@
     "x_bounds": [-0.5, 1.0],
     "y_bounds": [-0.5, 1.5]
   },
-  "model": {"n_basis": 16, "degree": 5, "interior_initialization": "coons"},
+  "model": {"n_basis": 16, "degree": 5, "interior_initialization": "random"},
   "sampling": {
     "interior_points": 30000,
     "boundary_points_per_edge": 250,

@@ -1,0 +1,31 @@
+{
+  "label": "kirchhoff_pinn_soft",
+  "gpu_index": "0",
+  "command": [
+    "python",
+    "Kirchoff/PINN_2D.py",
+    "--constraint",
+    "soft",
+    "--device",
+    "gpu"
+  ],
+  "solver_output_isolated": true,
+  "solver_return_code": 1,
+  "interrupted": false,
+  "stopped_by_runtime_limit": true,
+  "requested_max_runtime_s": 60.0,
+  "sampling_interval_ms": 500,
+  "raw_sample_count": 119,
+  "analyzed_sample_count": 109,
+  "requested_warmup_s": 5.0,
+  "warmup_exclusion_applied": true,
+  "wall_time_s": 60.020155599999995,
+  "gpu_utilization_mean_percent": 84.28440366972477,
+  "gpu_utilization_p95_percent": 89.0,
+  "gpu_utilization_max_percent": 89.0,
+  "memory_bandwidth_utilization_mean_percent": 85.95412844036697,
+  "baseline_memory_mib": 38.0,
+  "memory_used_mean_mib": 5600.0,
+  "memory_used_peak_mib": 5600.0,
+  "baseline_adjusted_peak_memory_mib": 5562.0
+}

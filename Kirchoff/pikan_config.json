@@ -5,7 +5,7 @@
     "length_x": 10.0, "length_y": 10.0, "load_amplitude": 0.015,
     "youngs_modulus": 30000.0, "thickness": 0.2, "poisson_ratio": 0.2
   },
-  "model": {"n_layers": 2, "n_neurons": 10, "grid": 5, "spline_order": 5, "constraint_mode": "soft"},
+  "model": {"n_layers": 2, "n_neurons": 10, "grid": 5, "spline_order": 5, "constraint_mode": "hard"},
   "sampling": {
     "interior_points": 30000, "boundary_points_per_edge": 250,
     "validation_points": 6000, "plot_points_per_axis": 150

@@ -8,9 +8,9 @@
   },
   "model": {
     "n_layers": 2,
-    "n_neurons": 10,
-    "grid": 5,
-    "spline_order": 3,
+    "n_neurons": 8,
+    "grid": 6,
+    "spline_order": 2,
     "constraint_mode": "hard"
   },
   "sampling": {

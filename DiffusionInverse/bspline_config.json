@@ -3,7 +3,7 @@
   "runtime": {"device": "gpu", "load_tuned_if_available": true},
   "problem": {"x_bounds": [0.0, 1.0], "time_bounds": [0.0, 1.0], "true_diffusivity": 0.03},
   "inverse": {"initial_diffusivity": 0.1, "minimum_diffusivity": 1e-7, "noise_std": 0.0},
-  "model": {"n_basis": 20, "degree": 3, "interior_initialization": "coons"},
+  "model": {"n_basis": 20, "degree": 3, "interior_initialization": "random"},
   "sampling": {"interior_points": 30000, "sensor_points": 250, "initial_points": 250, "validation_points": 6000, "plot_spatial_points": 150, "plot_time_points": 150},
   "loss_weights": {"pde": 1.0, "data": 1.0},
   "training": {

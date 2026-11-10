@@ -1,0 +1,29 @@
+{
+  "label": "diffusion_bspline",
+  "gpu_index": "0",
+  "command": [
+    "python",
+    "Diffusion/Bspline_2D.py",
+    "--device",
+    "gpu"
+  ],
+  "solver_output_isolated": true,
+  "solver_return_code": 0,
+  "interrupted": false,
+  "stopped_by_runtime_limit": false,
+  "requested_max_runtime_s": 60.0,
+  "sampling_interval_ms": 500,
+  "raw_sample_count": 60,
+  "analyzed_sample_count": 50,
+  "requested_warmup_s": 5.0,
+  "warmup_exclusion_applied": true,
+  "wall_time_s": 30.4362111,
+  "gpu_utilization_mean_percent": 18.4,
+  "gpu_utilization_p95_percent": 39.099999999999994,
+  "gpu_utilization_max_percent": 43.0,
+  "memory_bandwidth_utilization_mean_percent": 0.0,
+  "baseline_memory_mib": 38.0,
+  "memory_used_mean_mib": 498.76,
+  "memory_used_peak_mib": 502.0,
+  "baseline_adjusted_peak_memory_mib": 464.0
+}

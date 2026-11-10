@@ -15,6 +15,7 @@ TITLE_SIZE = 22
 LABEL_SIZE = 20
 TICK_SIZE = 17
 LEGEND_SIZE = 16
+SAVE_DPI = 650
 
 plt.rcParams.update({"font.size": BASE_FONT_SIZE})
 
@@ -175,7 +176,7 @@ def plot_comparison(
         rf"Absolute error ${field}$", fontsize=TITLE_SIZE, pad=12
     )
 
-    figure.savefig(output_path, format="pdf", dpi=650, bbox_inches="tight")
+    figure.savefig(output_path, format="pdf", dpi=SAVE_DPI, bbox_inches="tight")
 
 
 def load_training(data_path: Path) -> dict[str, np.ndarray | None]:
@@ -233,7 +234,7 @@ def plot_training_comparison(keys: tuple[str, ...], output_path: Path) -> None:
         axis.grid(True, which="both", alpha=0.25)
         axis.legend(loc="best", fontsize=LEGEND_SIZE)
 
-    figure.savefig(output_path, format="pdf", dpi=650, bbox_inches="tight")
+    figure.savefig(output_path, format="pdf", dpi=SAVE_DPI, bbox_inches="tight")
 
 
 def main(name: str, show: bool) -> None:
@@ -247,6 +248,9 @@ def main(name: str, show: bool) -> None:
         comparison_path = HERE / comparison_name
         plot_comparison(selected, field_index, comparison_path)
         print(f"Saved comparison figure: {comparison_path}")
+        if show:
+            plt.show()
+        plt.close("all")
 
     training_name = (
         "kovasznay_loss_evolution.pdf"
@@ -256,6 +260,9 @@ def main(name: str, show: bool) -> None:
     training_path = HERE / training_name
     plot_training_comparison(selected, training_path)
     print(f"Saved loss-evolution figure: {training_path}")
+    if show:
+        plt.show()
+    plt.close("all")
 
     for key in selected:
         stem, _ = SOLVERS[key]
@@ -268,12 +275,6 @@ def main(name: str, show: bool) -> None:
                 f"time={float(record['wall_time']):.3f} s"
             )
         print_statistics(key)
-
-    if show:
-        plt.show()
-    else:
-        plt.close("all")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Replot saved Kovasznay results")

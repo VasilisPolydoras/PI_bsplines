@@ -16,7 +16,7 @@
     "n_neurons": 8,
     "grid": 5,
     "spline_order": 3,
-    "constraint_mode": "hard"
+    "constraint_mode": "soft"
   },
   "sampling": {
     "interior_points": 30000,

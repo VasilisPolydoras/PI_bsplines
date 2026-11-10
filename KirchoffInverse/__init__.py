@@ -1,1 +1,0 @@
-"""Inverse Kirchhoff plate benchmark."""

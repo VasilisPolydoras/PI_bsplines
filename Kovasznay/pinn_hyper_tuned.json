@@ -2,8 +2,8 @@
   "hard": {
     "status": "not_tuned",
     "best_params": {
-      "n_layers": 4,
-      "n_neurons": 50
+      "n_layers": 5,
+      "n_neurons": 100
     }
   },
   "soft": {

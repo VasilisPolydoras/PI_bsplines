@@ -7,8 +7,8 @@
     "y_bounds": [-0.5, 1.5]
   },
   "model": {
-    "n_layers": 4,
-    "n_neurons": 64,
+    "n_layers": 5,
+    "n_neurons": 100,
     "activation": "tanh",
     "constraint_mode": "hard"
   },
